@@ -41,6 +41,13 @@
       "description": "Shows in root search how many threads need you or are working, refreshed in the background.",
       "mode": "no-view",
       "interval": "1m"
+    },
+    {
+      "name": "manage-environments",
+      "title": "Manage T3 Environments",
+      "subtitle": "T3 Code",
+      "description": "Add, edit and test the other computers whose T3 Code threads and projects the extension shows.",
+      "mode": "view"
     }
   ],
   "preferences": [

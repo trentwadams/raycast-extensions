@@ -171,11 +171,11 @@ export const PRIMARY_ENVIRONMENT = "primary";
  * lives in local storage, which Raycast keeps in its encrypted database. */
 const STORED_ENVIRONMENTS_KEY = "environments";
 
-const trimOrigin = (origin: string) => origin.trim().replace(/\/+$/, "");
+export const trimOrigin = (origin: string) => origin.trim().replace(/\/+$/, "");
 
 /** The environments added beyond the primary, in the order they were arranged. A
  * malformed entry is skipped rather than failing every command. */
-async function loadStoredEnvironments(): Promise<Environment[]> {
+export async function loadStoredEnvironments(): Promise<Environment[]> {
   const raw = await LocalStorage.getItem<string>(STORED_ENVIRONMENTS_KEY);
   if (!raw) {
     return [];
@@ -202,6 +202,9 @@ async function loadStoredEnvironments(): Promise<Environment[]> {
     return [];
   }
 }
+
+export const storeEnvironments = (environments: Environment[]) =>
+  LocalStorage.setItem(STORED_ENVIRONMENTS_KEY, JSON.stringify(environments));
 
 /** Every configured environment: the primary first, then the stored ones. */
 export async function loadEnvironments(): Promise<Environment[]> {
@@ -319,6 +322,13 @@ async function serverProtocolVersion(
   );
 }
 
+/** The primary environment is set up in the preferences, every other one in the
+ * Manage T3 Environments command, so an error points at the right place. */
+const whereConfigured = (environment: Environment) =>
+  environment.key === PRIMARY_ENVIRONMENT
+    ? "the extension preferences"
+    : "Manage T3 Environments";
+
 async function request<T>(
   environment: Environment,
   path: string,
@@ -330,7 +340,7 @@ async function request<T>(
   if (!token) {
     throw new T3Error(
       "unauthorized",
-      "No access token is set for this environment. Add one in the extension preferences.",
+      `No access token is set for this environment. Add one in ${whereConfigured(environment)}.`,
     );
   }
   const version = versioned ? await serverProtocolVersion(environment) : 1;
@@ -354,7 +364,7 @@ async function request<T>(
   if (response.status === 401 || response.status === 403) {
     throw new T3Error(
       "unauthorized",
-      "T3 Code rejected the access token. Reissue it and update the extension preferences.",
+      `T3 Code rejected the access token. Reissue it and update it in ${whereConfigured(environment)}.`,
     );
   }
   if (!response.ok) {
@@ -517,6 +527,217 @@ export async function loadShells(): Promise<{
     failures: results.filter(
       (result): result is EnvironmentFailure => "error" in result,
     ),
+  };
+}
+
+/** Why an origin cannot hold a token, or undefined when it can: the same rule every
+ * request enforces, checked before anything is saved. */
+export function originProblem(origin: string): string | undefined {
+  try {
+    if (!/^https?:$/.test(new URL(origin).protocol)) {
+      return "The origin must start with https:// or http://.";
+    }
+    assertTokenSafeOrigin(origin);
+    return undefined;
+  } catch (error) {
+    return errorMessage(error);
+  }
+}
+
+/** What a server says about itself once its token works. */
+export type ConnectionCheck = {
+  environmentId: string | undefined;
+  label: string | undefined;
+  serverVersion: string | undefined;
+  threadCount: number;
+};
+
+/** A machine that is asleep can take a minute to fail, so a check gives up sooner. */
+const CHECK_TIMEOUT_MS = 10_000;
+
+async function withinCheckTimeout<T>(
+  origin: string,
+  work: Promise<T>,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new T3Error(
+            "unreachable",
+            `${origin} did not answer within ${CHECK_TIMEOUT_MS / 1000} seconds.`,
+          ),
+        ),
+      CHECK_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Asks the server to describe itself and reads its threads with the token, the two
+ * things every command needs. Nothing cached earlier in the run is reused, so a
+ * restarted server or an edited token is seen as it is now. */
+export async function checkConnection(
+  environment: Environment,
+): Promise<ConnectionCheck> {
+  descriptors.delete(environment.origin);
+  serverConfigs.delete(environment.origin);
+  const [descriptor, snapshot] = await withinCheckTimeout(
+    environment.origin,
+    Promise.all([serverDescriptor(environment), getShell(environment)]),
+  );
+  return {
+    environmentId: descriptor.environmentId,
+    label: descriptor.label?.trim() || undefined,
+    serverVersion: descriptor.serverVersion,
+    threadCount: liveThreads(snapshot).length,
+  };
+}
+
+/** The id a server goes by, read without a token: the descriptor is public, which lets
+ * two entries for one server be told apart before any credential is sent or spent.
+ * Undefined when the server cannot be asked. */
+export async function environmentIdAt(
+  origin: string,
+): Promise<string | undefined> {
+  if (originProblem(origin)) {
+    return undefined;
+  }
+  try {
+    const response = await withinCheckTimeout(
+      origin,
+      fetch(`${origin}/.well-known/t3/environment`),
+    );
+    if (!response.ok) {
+      return undefined;
+    }
+    return ((await response.json()) as EnvironmentDescriptor).environmentId;
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a pairing link carries: the server it was issued on, when the link names it,
+ * and the one-time credential. */
+export type PairingLink = { origin: string | undefined; credential: string };
+
+/** Reads the forms T3 hands out: a `t3code://pair?pairingUrl=…` link, the pairing URL
+ * inside it (`https://host/pair#token=…`, or a hosted one naming its server in
+ * `host`), or the bare credential `t3 auth pairing create` prints. */
+export function parsePairingLink(text: string): PairingLink | undefined {
+  const value = text.trim();
+  if (!value) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return /\s/.test(value)
+      ? undefined
+      : { origin: undefined, credential: value };
+  }
+  if (/^t3code(-[a-z]+)?:$/.test(url.protocol)) {
+    const inner =
+      url.host === "pair" ? url.searchParams.get("pairingUrl") : null;
+    return inner ? parsePairingLink(inner) : undefined;
+  }
+  if (!/^https?:$/.test(url.protocol)) {
+    return undefined;
+  }
+  const credential = (
+    new URLSearchParams(url.hash.slice(1)).get("token") ??
+    url.searchParams.get("token") ??
+    ""
+  ).trim();
+  if (!credential) {
+    return undefined;
+  }
+  const host = url.searchParams.get("host")?.trim();
+  if (host) {
+    try {
+      return {
+        origin: new URL(/^[a-z]+:\/\//i.test(host) ? host : `https://${host}`)
+          .origin,
+        credential,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+  return { origin: url.origin, credential };
+}
+
+/** The two scopes the extension uses, the same ones the README's token command asks for. */
+const CLIENT_SCOPES = ["orchestration:read", "orchestration:operate"];
+
+/** Trades a one-time pairing credential for a bearer token, the exchange T3's own
+ * clients make for a headless session. Only the two scopes the extension uses are
+ * asked for, and the server grants no more than the pairing link allows. The session
+ * lasts T3's default of 30 days; a pairing exchange cannot ask for longer. */
+export async function exchangePairingCredential(
+  origin: string,
+  credential: string,
+): Promise<{ token: string; scopes: string[]; expiresAt: Date }> {
+  // Until it is used, the credential is as good as a token, so it gets the same rule.
+  assertTokenSafeOrigin(origin);
+  let response: Response;
+  try {
+    response = await fetch(`${origin}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+        subject_token: credential,
+        subject_token_type:
+          "urn:t3:params:oauth:token-type:environment-bootstrap",
+        requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+        scope: CLIENT_SCOPES.join(" "),
+        client_label: "Raycast",
+        client_device_type: "desktop",
+      }).toString(),
+      signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+    });
+  } catch {
+    throw new T3Error(
+      "unreachable",
+      `Cannot reach the T3 Code server at ${origin}.`,
+    );
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new T3Error(
+      "unauthorized",
+      "T3 Code rejected the pairing link. A link works once and expires after a few minutes, so create a new one.",
+    );
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new T3Error(
+      "http",
+      `T3 Code returned ${response.status} for the pairing link. ${body.slice(0, 200)}`,
+    );
+  }
+  const result = (await response.json()) as {
+    access_token: string;
+    token_type: string;
+    expires_in: number;
+    scope: string;
+  };
+  if (result.token_type !== "Bearer") {
+    throw new T3Error(
+      "http",
+      `T3 Code issued a ${result.token_type} token, which the extension cannot use.`,
+    );
+  }
+  return {
+    token: result.access_token,
+    scopes: result.scope.split(" ").filter(Boolean),
+    expiresAt: new Date(Date.now() + result.expires_in * 1000),
   };
 }
 

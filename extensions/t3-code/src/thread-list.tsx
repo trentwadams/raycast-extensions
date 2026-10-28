@@ -3,6 +3,8 @@ import {
   ActionPanel,
   Color,
   Icon,
+  launchCommand,
+  LaunchType,
   List,
   showToast,
   Toast,
@@ -290,6 +292,16 @@ function FailureItem(props: {
               }}
             />
           ) : null}
+          <Action
+            title="Manage Environments"
+            icon={Icon.Network}
+            onAction={() =>
+              launchCommand({
+                name: "manage-environments",
+                type: LaunchType.UserInitiated,
+              })
+            }
+          />
           <Action.CopyToClipboard
             title="Copy Error"
             content={`${label} (${environment.origin}): ${errorMessage(error)}`}
