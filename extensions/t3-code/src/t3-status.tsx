@@ -4,7 +4,13 @@ import {
   LaunchType,
   updateCommandMetadata,
 } from "@raycast/api";
-import { getShell, ShellSnapshot, T3Error, Thread } from "./t3";
+import {
+  getShell,
+  loadEnvironments,
+  ShellSnapshot,
+  T3Error,
+  Thread,
+} from "./t3";
 import {
   listedThreads,
   NEEDS_YOU,
@@ -95,7 +101,8 @@ function errorSubtitle(error: unknown): string {
 export default async function Command() {
   let counts: StatusCounts | null = null;
   try {
-    counts = countThreads(await getShell());
+    const [environment] = await loadEnvironments();
+    counts = countThreads(await getShell(environment));
     await updateCommandMetadata({ subtitle: statusSubtitle(counts) });
   } catch (error) {
     await updateCommandMetadata({ subtitle: errorSubtitle(error) }).catch(

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { getPreferenceValues, open } from "@raycast/api";
+import { getPreferenceValues, LocalStorage, open } from "@raycast/api";
 import { openRpc, RpcConnection } from "./rpc";
 import { DEFAULT_SNOOZE_PRESETS, SnoozePresetSetting } from "./thread-state";
 
@@ -106,6 +106,8 @@ export type ShellSnapshot = {
 type EnvironmentDescriptor = {
   /** The id the desktop app routes threads under: /<environmentId>/<threadId>. */
   environmentId?: string;
+  /** The server's own name for its machine, e.g. the host name. */
+  label?: string;
   serverVersion?: string;
   /** Absent on servers that predate protocol v2. */
   orchestrationProtocolVersion?: number;
@@ -130,7 +132,77 @@ export const errorMessage = (error: unknown) =>
 export const RUNTIME_DIR = join(homedir(), ".t3", "userdata");
 export const WORKTREES_DIR = join(homedir(), ".t3", "worktrees");
 
-export const preferences = () => getPreferenceValues<Preferences>();
+const preferences = () => getPreferenceValues<Preferences>();
+
+/** One T3 Code server the extension talks to. Every request names the environment it
+ * goes to, so a thread is always acted on by the server it lives on. */
+export type Environment = {
+  /** Stable across runs and edits, since presets and the last-used project store it. */
+  key: string;
+  /** The name given to it. Empty means the server's own label is used. */
+  name: string;
+  origin: string;
+  token: string;
+};
+
+/** The original Access Token and Server Origin preferences, so existing setups keep
+ * working with nothing to migrate. */
+export const PRIMARY_ENVIRONMENT = "primary";
+
+/** Preferences hold a fixed set of fields, so every environment beyond the primary
+ * lives in local storage, which Raycast keeps in its encrypted database. */
+const STORED_ENVIRONMENTS_KEY = "environments";
+
+const trimOrigin = (origin: string) => origin.trim().replace(/\/+$/, "");
+
+/** The environments added beyond the primary, in the order they were arranged. A
+ * malformed entry is skipped rather than failing every command. */
+async function loadStoredEnvironments(): Promise<Environment[]> {
+  const raw = await LocalStorage.getItem<string>(STORED_ENVIRONMENTS_KEY);
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<Environment>[];
+    return Array.isArray(parsed)
+      ? parsed.flatMap(({ key, name, origin, token } = {}) =>
+          typeof key === "string" &&
+          typeof origin === "string" &&
+          typeof token === "string"
+            ? [
+                {
+                  key,
+                  name: typeof name === "string" ? name : "",
+                  origin,
+                  token,
+                },
+              ]
+            : [],
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Every configured environment: the primary first, then the stored ones. */
+export async function loadEnvironments(): Promise<Environment[]> {
+  const [primary, stored] = await Promise.all([
+    primaryEnvironment(),
+    loadStoredEnvironments(),
+  ]);
+  return [primary, ...stored];
+}
+
+async function primaryEnvironment(): Promise<Environment> {
+  const prefs = preferences();
+  return {
+    key: PRIMARY_ENVIRONMENT,
+    name: prefs.name?.trim() ?? "",
+    origin: await resolveOrigin(),
+    token: prefs.token,
+  };
+}
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -164,12 +236,13 @@ function assertTokenSafeOrigin(origin: string): void {
   );
 }
 
-/** A configured origin wins; otherwise the running server publishes its own port. The
- * file survives restarts with a stale port, so a failed fetch still means "not running". */
-export async function resolveOrigin(): Promise<string> {
+/** The primary environment's origin: a configured one wins, otherwise the running
+ * server publishes its own port. The file survives restarts with a stale port, so a
+ * failed fetch still means "not running". */
+async function resolveOrigin(): Promise<string> {
   const configured = preferences().origin?.trim();
   if (configured) {
-    return configured.replace(/\/$/, "");
+    return trimOrigin(configured);
   }
   try {
     const raw = await readFile(
@@ -182,7 +255,7 @@ export async function resolveOrigin(): Promise<string> {
       port?: number;
     };
     if (parsed.origin) {
-      return parsed.origin.replace(/\/$/, "");
+      return trimOrigin(parsed.origin);
     }
     if (parsed.host && parsed.port) {
       return `http://${parsed.host}:${parsed.port}`;
@@ -199,39 +272,50 @@ const descriptors = new Map<string, Promise<EnvironmentDescriptor>>();
 
 /** The server describes itself once per command run. Cached per origin, so a server
  * that restarts on another port or version is asked again. */
-function serverDescriptor(origin: string): Promise<EnvironmentDescriptor> {
-  let descriptor = descriptors.get(origin);
+function serverDescriptor(
+  environment: Environment,
+): Promise<EnvironmentDescriptor> {
+  let descriptor = descriptors.get(environment.origin);
   if (!descriptor) {
     descriptor = request<EnvironmentDescriptor>(
+      environment,
       "/.well-known/t3/environment",
       undefined,
       false,
-      origin,
     ).catch((error) => {
-      descriptors.delete(origin);
+      descriptors.delete(environment.origin);
       throw error;
     });
-    descriptors.set(origin, descriptor);
+    descriptors.set(environment.origin, descriptor);
   }
   return descriptor;
 }
 
 /** v2 servers reject orchestration reads without the protocol header; older servers
  * predate the field, so a missing value means v1. */
-async function serverProtocolVersion(origin: string): Promise<number> {
-  return (await serverDescriptor(origin)).orchestrationProtocolVersion ?? 1;
+async function serverProtocolVersion(
+  environment: Environment,
+): Promise<number> {
+  return (
+    (await serverDescriptor(environment)).orchestrationProtocolVersion ?? 1
+  );
 }
 
 async function request<T>(
+  environment: Environment,
   path: string,
   init?: RequestInit,
   versioned = true,
-  knownOrigin?: string,
 ): Promise<T> {
-  const origin = knownOrigin ?? (await resolveOrigin());
+  const { origin, token } = environment;
   assertTokenSafeOrigin(origin);
-  const { token } = preferences();
-  const version = versioned ? await serverProtocolVersion(origin) : 1;
+  if (!token) {
+    throw new T3Error(
+      "unauthorized",
+      "No access token is set for this environment. Add one in the extension preferences.",
+    );
+  }
+  const version = versioned ? await serverProtocolVersion(environment) : 1;
   let response: Response;
   try {
     response = await fetch(`${origin}${path}`, {
@@ -294,17 +378,25 @@ function normalizeThread(thread: Thread): Thread {
   };
 }
 
-export const getShell = async (): Promise<ShellSnapshot> => {
-  const snapshot = await request<ShellSnapshot>("/api/orchestration/shell");
+export const getShell = async (
+  environment: Environment,
+): Promise<ShellSnapshot> => {
+  const snapshot = await request<ShellSnapshot>(
+    environment,
+    "/api/orchestration/shell",
+  );
   return { ...snapshot, threads: snapshot.threads.map(normalizeThread) };
 };
 
 /** Protocol v2 creates threads over the WebSocket, v1 over HTTP dispatch. */
-export const getProtocolVersion = async (): Promise<number> =>
-  serverProtocolVersion(await resolveOrigin());
+export const getProtocolVersion = (environment: Environment): Promise<number> =>
+  serverProtocolVersion(environment);
 
-export const dispatch = (command: Record<string, unknown>) =>
-  request<{ sequence: number }>("/api/orchestration/dispatch", {
+export const dispatch = (
+  environment: Environment,
+  command: Record<string, unknown>,
+) =>
+  request<{ sequence: number }>(environment, "/api/orchestration/dispatch", {
     method: "POST",
     body: JSON.stringify(command),
   });
@@ -317,8 +409,10 @@ export type ServerInfo = {
   capabilities: Record<string, unknown>;
 };
 
-export async function getServerInfo(): Promise<ServerInfo> {
-  const descriptor = await serverDescriptor(await resolveOrigin());
+export async function getServerInfo(
+  environment: Environment,
+): Promise<ServerInfo> {
+  const descriptor = await serverDescriptor(environment);
   return {
     protocolVersion: descriptor.orchestrationProtocolVersion ?? 1,
     environmentId: descriptor.environmentId,
@@ -326,12 +420,95 @@ export async function getServerInfo(): Promise<ServerInfo> {
   };
 }
 
+/** A short name when neither the preferences nor the server give one: the machine
+ * name of a tailnet host, or the host and port of an address. */
+function fallbackLabel(origin: string): string {
+  try {
+    const { hostname, host } = new URL(origin);
+    return /^[\d.]+$|^\[|^localhost$/.test(hostname)
+      ? host
+      : hostname.split(".")[0];
+  } catch {
+    return origin;
+  }
+}
+
+/** The name set in the preferences, else the one the server gives itself. */
+export async function environmentLabel(
+  environment: Environment,
+): Promise<string> {
+  if (environment.name) {
+    return environment.name;
+  }
+  try {
+    return (
+      (await serverDescriptor(environment)).label?.trim() ||
+      fallbackLabel(environment.origin)
+    );
+  } catch {
+    return fallbackLabel(environment.origin);
+  }
+}
+
+/** One environment's threads and projects. */
+export type EnvironmentShell = {
+  environment: Environment;
+  label: string;
+  snapshot: ShellSnapshot;
+  /** Undefined when the server cannot describe itself; the list then offers no
+   * actions beyond opening and copying. */
+  server: ServerInfo | undefined;
+};
+
+/** An environment that could not be read, and why. */
+export type EnvironmentFailure = {
+  environment: Environment;
+  label: string;
+  error: Error;
+};
+
+/** Reads every environment at once. One that fails is reported next to the others
+ * rather than failing them all. */
+export async function loadShells(): Promise<{
+  environments: Environment[];
+  shells: EnvironmentShell[];
+  failures: EnvironmentFailure[];
+}> {
+  const environments = await loadEnvironments();
+  const results = await Promise.all(
+    environments.map(
+      async (environment): Promise<EnvironmentShell | EnvironmentFailure> => {
+        const [snapshot, server, label] = await Promise.all([
+          getShell(environment).catch((error: unknown) =>
+            error instanceof Error ? error : new Error(String(error)),
+          ),
+          getServerInfo(environment).catch(() => undefined),
+          environmentLabel(environment),
+        ]);
+        return snapshot instanceof Error
+          ? { environment, label, error: snapshot }
+          : { environment, label, snapshot, server };
+      },
+    ),
+  );
+  return {
+    environments,
+    shells: results.filter(
+      (result): result is EnvironmentShell => "snapshot" in result,
+    ),
+    failures: results.filter(
+      (result): result is EnvironmentFailure => "error" in result,
+    ),
+  };
+}
+
 /** Sends one orchestration command over the WebSocket, the only way protocol v2 takes
  * them. The command id is filled in here. */
 export async function dispatchCommand(
+  environment: Environment,
   command: { type: string; threadId: string } & Record<string, unknown>,
 ): Promise<void> {
-  const rpc = await openServerRpc();
+  const rpc = await openServerRpc(environment);
   try {
     await rpc.call("orchestration.dispatchCommand", {
       commandId: randomUUID(),
@@ -449,9 +626,47 @@ type ProviderInstance = {
 
 type T3Settings = {
   providerInstances?: Record<string, ProviderInstance | undefined>;
-  favorites?: { provider: string; model: string }[];
+  favorites?: { provider: string; model: string }[] | null;
   snoozePresets?: SnoozePresetSetting[];
 };
+
+/** The parts of server.getConfig the extension reads: the same settings as the file
+ * on disk, and the models each provider instance offers right now. */
+type ServerConfig = {
+  settings?: T3Settings;
+  providers?: {
+    instanceId: string;
+    driver: string;
+    displayName?: string;
+    enabled: boolean;
+    availability?: string;
+    models: { slug: string }[];
+  }[];
+};
+
+const serverConfigs = new Map<string, Promise<ServerConfig>>();
+
+/** A server on another machine shares its settings and models over the WebSocket.
+ * Older servers, or one that cannot be asked, leave the extension on T3's defaults
+ * and the models its threads already use. */
+function serverConfig(environment: Environment): Promise<ServerConfig> {
+  let config = serverConfigs.get(environment.origin);
+  if (!config) {
+    config = (async () => {
+      if ((await serverProtocolVersion(environment)) < 2) {
+        return {};
+      }
+      const rpc = await openServerRpc(environment);
+      try {
+        return await rpc.call<ServerConfig>("server.getConfig", {});
+      } finally {
+        rpc.close();
+      }
+    })().catch(() => ({}));
+    serverConfigs.set(environment.origin, config);
+  }
+  return config;
+}
 
 const DRIVER_NAMES: Record<string, string> = {
   claudeAgent: "Claude",
@@ -462,7 +677,36 @@ const DRIVER_NAMES: Record<string, string> = {
   opencode: "OpenCode",
 };
 
-async function readSettings(): Promise<T3Settings> {
+/** The settings, model manifest and runtime files under ~/.t3 describe the install on
+ * this machine, so they only apply to the server that is that install: a loopback one
+ * whose id matches the id stored beside them. A Mac, or a second server on another
+ * port, never inherits this machine's settings. */
+export async function isThisMachine(
+  environment: Environment,
+): Promise<boolean> {
+  if (!isLoopback(environment.origin)) {
+    return false;
+  }
+  let localId: string;
+  try {
+    localId = (
+      await readFile(join(RUNTIME_DIR, "environment-id"), "utf8")
+    ).trim();
+  } catch {
+    // An install that predates the file: loopback is all there is to go on.
+    return true;
+  }
+  try {
+    return (await serverDescriptor(environment)).environmentId === localId;
+  } catch {
+    return false;
+  }
+}
+
+async function readSettings(environment: Environment): Promise<T3Settings> {
+  if (!(await isThisMachine(environment))) {
+    return (await serverConfig(environment)).settings ?? {};
+  }
   try {
     return JSON.parse(
       await readFile(join(RUNTIME_DIR, "settings.json"), "utf8"),
@@ -473,8 +717,10 @@ async function readSettings(): Promise<T3Settings> {
 }
 
 /** The name T3 shows for each provider instance: the one you gave it, else its driver's. */
-export async function providerNames(): Promise<Record<string, string>> {
-  const { providerInstances = {} } = await readSettings();
+export async function providerNames(
+  environment: Environment,
+): Promise<Record<string, string>> {
+  const { providerInstances = {} } = await readSettings(environment);
   const names: Record<string, string> = {};
   for (const [id, instance] of Object.entries(providerInstances)) {
     names[id] =
@@ -483,24 +729,34 @@ export async function providerNames(): Promise<Record<string, string>> {
       instance?.driver ??
       id;
   }
+  // A server on another machine also names the instances its settings leave at the
+  // defaults.
+  if (!(await isThisMachine(environment))) {
+    for (const provider of (await serverConfig(environment)).providers ?? []) {
+      names[provider.instanceId] ??=
+        provider.displayName ??
+        DRIVER_NAMES[provider.driver] ??
+        provider.driver;
+    }
+  }
   return names;
 }
 
 /** Models starred in the T3 app, so the stars here match the ones in the sidebar. They
  * match on provider and model alone, since a starred model carries no effort setting. */
-export async function t3Favorites(): Promise<string[]> {
-  const { favorites = [] } = await readSettings();
-  return favorites.map((favorite) => `${favorite.provider}|${favorite.model}`);
+export async function t3Favorites(environment: Environment): Promise<string[]> {
+  const { favorites } = await readSettings(environment);
+  return (favorites ?? []).map(
+    (favorite) => `${favorite.provider}|${favorite.model}`,
+  );
 }
 
 /** The snooze presets set in T3, so the menu offers the same times as the app's. A
  * remote server's settings are not on this machine, so it gets T3's defaults. */
-export async function snoozePresets(): Promise<SnoozePresetSetting[]> {
-  const configured = preferences().origin?.trim();
-  if (configured && !isLoopback(configured)) {
-    return DEFAULT_SNOOZE_PRESETS;
-  }
-  const { snoozePresets: presets } = await readSettings();
+export async function snoozePresets(
+  environment: Environment,
+): Promise<SnoozePresetSetting[]> {
+  const { snoozePresets: presets } = await readSettings(environment);
   return Array.isArray(presets) && presets.length > 0
     ? presets
     : DEFAULT_SNOOZE_PRESETS;
@@ -569,12 +825,29 @@ export const modelLabel = (
  * models an instance declares. A second instance of a driver with none of its own falls
  * back to that driver's list. Read from disk because the server publishes the manifest
  * over the WebSocket only; a missing or unreadable file just means the picker falls back
- * to what threads already use. */
-async function manifestSelections(): Promise<ModelSelection[]> {
+ * to what threads already use. A server on another machine is asked for its providers'
+ * models instead. */
+async function manifestSelections(
+  environment: Environment,
+): Promise<ModelSelection[]> {
+  if (!(await isThisMachine(environment))) {
+    const { providers = [] } = await serverConfig(environment);
+    return providers
+      .filter(
+        (provider) =>
+          provider.enabled && provider.availability !== "unavailable",
+      )
+      .flatMap((provider) =>
+        provider.models.map((model) => ({
+          instanceId: provider.instanceId,
+          model: model.slug,
+        })),
+      );
+  }
   try {
     const [manifestRaw, settings] = await Promise.all([
       readFile(join(RUNTIME_DIR, "model-manifest.json"), "utf8"),
-      readSettings(),
+      readSettings(environment),
     ]);
     const manifest = JSON.parse(manifestRaw) as {
       manifest?: { currentModels?: Record<string, string[]> };
@@ -600,9 +873,10 @@ async function manifestSelections(): Promise<ModelSelection[]> {
   }
 }
 
-/** Every selection worth offering: the ones this machine has actually run, most
+/** Every selection worth offering: the ones the environment has actually run, most
  * recently used first, then anything else the enabled providers currently support. */
 export async function modelChoices(
+  environment: Environment,
   snapshot: ShellSnapshot,
   names: Record<string, string> = {},
 ): Promise<{ key: string; label: string; selection: ModelSelection }[]> {
@@ -636,7 +910,7 @@ export async function modelChoices(
       selection: value.selection,
     }));
 
-  const extra = (await manifestSelections())
+  const extra = (await manifestSelections(environment))
     .filter((selection) => !seen.has(modelKey(selection)))
     .map((selection) => ({
       key: modelKey(selection),
@@ -697,8 +971,9 @@ const isInstalled = async (name: string) =>
   (await installedPath(name)) !== undefined;
 
 /** The app bundle is named after its release channel, so a fixed name only fits one
- * of them. The preference wins; otherwise follow the running server's version, and
- * with no server running use whichever app is installed, stable first. */
+ * of them. The preference wins; otherwise follow the version of the primary server,
+ * the one the desktop app on this machine runs, and with no server running use
+ * whichever app is installed, stable first. */
 async function appName(): Promise<string> {
   const configured = preferences().appName?.trim();
   if (
@@ -709,7 +984,9 @@ async function appName(): Promise<string> {
   }
   const stable = await installedStableApp();
   try {
-    const { serverVersion } = await serverDescriptor(await resolveOrigin());
+    const { serverVersion } = await serverDescriptor(
+      await primaryEnvironment(),
+    );
     if (serverVersion) {
       return NIGHTLY_VERSION.test(serverVersion) ? NIGHTLY_APP : stable;
     }
@@ -806,14 +1083,15 @@ export const threadLink = (environmentId: string, threadId: string) =>
   `t3code://threads/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
 
 /** The link that opens this thread in the desktop app, or undefined when the server
- * is too old for the app to follow one, or cannot be asked. */
+ * is too old for the app to follow one, or cannot be asked. The link names the
+ * thread's own environment, which the app can open once it is paired with it. */
 export async function threadLinkFor(
+  environment: Environment,
   threadId: string,
 ): Promise<string | undefined> {
   try {
-    const { environmentId, serverVersion } = await serverDescriptor(
-      await resolveOrigin(),
-    );
+    const { environmentId, serverVersion } =
+      await serverDescriptor(environment);
     return environmentId &&
       serverVersion &&
       versionAtLeast(serverVersion, THREAD_LINK_MIN_VERSION)
@@ -827,9 +1105,10 @@ export async function threadLinkFor(
 /** Opens the thread itself through its deep link. Servers too old for the app to
  * follow one fall back to driving the command palette. */
 export async function focusThread(
+  environment: Environment,
   target: PaletteThread,
 ): Promise<"opened" | "ambiguous" | "unfocused"> {
-  const link = await threadLinkFor(target.id);
+  const link = await threadLinkFor(environment, target.id);
   if (link) {
     await openAppLink(link);
     return "opened";
@@ -839,7 +1118,7 @@ export async function focusThread(
     await launchApp();
     return "unfocused";
   }
-  return focusThreadInPalette(target);
+  return focusThreadInPalette(environment, target);
 }
 
 /** Both release channels register the same t3code:// scheme, so whichever installed
@@ -868,6 +1147,7 @@ async function openAppLink(link: string): Promise<void> {
  * otherwise the palette is left as it is and the result says why, so the caller can
  * tell the user. */
 async function focusThreadInPalette(
+  environment: Environment,
   target: PaletteThread,
 ): Promise<"opened" | "ambiguous" | "unfocused"> {
   const query = paletteQuery(target);
@@ -884,7 +1164,7 @@ tell application "System Events"
   keystroke "${escapeForAppleScript(query)}"
 end tell`,
   ]);
-  const live = paletteThreads(await getShell());
+  const live = paletteThreads(await getShell(environment));
   // A thread that was just created can lag behind the shell projection.
   const candidates = live.some((thread) => thread.id === target.id)
     ? live
@@ -1037,22 +1317,25 @@ export async function removeWorktree(
   }
 }
 
-export async function startSession(input: {
-  projectId: string;
-  prompt: string;
-  /** Defaults to the first line of the prompt. */
-  title?: string;
-  modelSelection: ModelSelection;
-  runtimeMode: RuntimeMode;
-  branch: string | null;
-  worktreePath: string | null;
-  attachments?: AttachmentFile[];
-}): Promise<string> {
+export async function startSession(
+  environment: Environment,
+  input: {
+    projectId: string;
+    prompt: string;
+    /** Defaults to the first line of the prompt. */
+    title?: string;
+    modelSelection: ModelSelection;
+    runtimeMode: RuntimeMode;
+    branch: string | null;
+    worktreePath: string | null;
+    attachments?: AttachmentFile[];
+  },
+): Promise<string> {
   const threadId = randomUUID();
   const createdAt = new Date().toISOString();
   const title = input.title ?? threadTitle(input.prompt);
 
-  await dispatch({
+  await dispatch(environment, {
     type: "thread.create",
     commandId: randomUUID(),
     threadId,
@@ -1067,7 +1350,7 @@ export async function startSession(input: {
   });
 
   try {
-    await dispatch({
+    await dispatch(environment, {
       type: "thread.turn.start",
       commandId: randomUUID(),
       threadId,
@@ -1088,7 +1371,7 @@ export async function startSession(input: {
   } catch (error) {
     // An empty thread is worse than none: drop it so a retry does not pile up
     // half-started sessions in the sidebar.
-    await dispatch({
+    await dispatch(environment, {
       type: "thread.delete",
       commandId: randomUUID(),
       threadId,
@@ -1201,16 +1484,14 @@ async function inlineAttachment(attachment: AttachmentFile) {
   };
 }
 
-async function openServerRpc(): Promise<RpcConnection> {
-  const origin = await resolveOrigin();
-  const version = await serverProtocolVersion(origin);
+async function openServerRpc(environment: Environment): Promise<RpcConnection> {
+  const version = await serverProtocolVersion(environment);
   const { ticket } = await request<{ ticket: string }>(
+    environment,
     "/api/auth/websocket-ticket",
     { method: "POST" },
-    true,
-    origin,
   );
-  const url = new URL(origin);
+  const url = new URL(environment.origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/ws";
   url.search = new URLSearchParams({
@@ -1230,10 +1511,10 @@ async function openServerRpc(): Promise<RpcConnection> {
 /** v2 servers hold uploads until a turn claims them: ask for a signed URL, post the
  * bytes there, then reference the attachment by id. */
 async function uploadAttachments(
+  environment: Environment,
   rpc: RpcConnection,
   attachments: AttachmentFile[],
 ) {
-  const origin = await resolveOrigin();
   const uploaded = [];
   for (const attachment of attachments) {
     const slot = await rpc.call<{ attachmentId: string; relativeUrl: string }>(
@@ -1245,7 +1526,7 @@ async function uploadAttachments(
         sizeBytes: attachment.sizeBytes,
       },
     );
-    const response = await fetch(`${origin}${slot.relativeUrl}`, {
+    const response = await fetch(`${environment.origin}${slot.relativeUrl}`, {
       method: "POST",
       headers: { "Content-Type": attachment.mimeType },
       body: await readFile(attachment.path),
@@ -1272,25 +1553,32 @@ async function uploadAttachments(
 
 /** The v2 path. One call creates the thread, prepares its worktree and sends the first
  * message, so the extension no longer runs git itself. */
-export async function launchThread(input: {
-  projectId: string;
-  title: string;
-  prompt: string;
-  modelSelection: ModelSelection;
-  runtimeMode: RuntimeMode;
-  workspace:
-    | { type: "root" }
-    | {
-        type: "worktree";
-        baseRef: string;
-        branch: string;
-        startFromOrigin: boolean;
-      };
-  attachments: AttachmentFile[];
-}): Promise<string> {
-  const rpc = await openServerRpc();
+export async function launchThread(
+  environment: Environment,
+  input: {
+    projectId: string;
+    title: string;
+    prompt: string;
+    modelSelection: ModelSelection;
+    runtimeMode: RuntimeMode;
+    workspace:
+      | { type: "root" }
+      | {
+          type: "worktree";
+          baseRef: string;
+          branch: string;
+          startFromOrigin: boolean;
+        };
+    attachments: AttachmentFile[];
+  },
+): Promise<string> {
+  const rpc = await openServerRpc(environment);
   try {
-    const attachments = await uploadAttachments(rpc, input.attachments);
+    const attachments = await uploadAttachments(
+      environment,
+      rpc,
+      input.attachments,
+    );
     const result = await rpc.call<{ threadId: string }>(
       "orchestration.launchThread",
       {
@@ -1320,4 +1608,32 @@ export async function launchThread(input: {
 
 export async function hasOriginRemote(workspaceRoot: string): Promise<boolean> {
   return hasOrigin(workspaceRoot);
+}
+
+/** Where a new worktree branches from when the repository is not on this machine. The
+ * server lists the repository's refs with its default branch marked, which answers
+ * what defaultBaseBranch and hasOriginRemote work out locally. */
+export async function serverBaseRef(
+  environment: Environment,
+  workspaceRoot: string,
+): Promise<{ baseRef: string; startFromOrigin: boolean }> {
+  const rpc = await openServerRpc(environment);
+  try {
+    const result = await rpc.call<{
+      isRepo: boolean;
+      hasPrimaryRemote: boolean;
+      refs: { name: string; current: boolean; isDefault: boolean }[];
+    }>("vcs.listRefs", { cwd: workspaceRoot, refKind: "local" });
+    const base =
+      result.refs.find((ref) => ref.isDefault) ??
+      result.refs.find((ref) => ref.current);
+    if (!result.isRepo || !base) {
+      throw new Error(
+        "That project is not a git repository with a branch to start a worktree from.",
+      );
+    }
+    return { baseRef: base.name, startFromOrigin: result.hasPrimaryRemote };
+  } finally {
+    rpc.close();
+  }
 }

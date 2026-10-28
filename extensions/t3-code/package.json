@@ -62,6 +62,14 @@
       "placeholder": "http://127.0.0.1:3773"
     },
     {
+      "name": "name",
+      "type": "textfield",
+      "required": false,
+      "title": "Environment Name",
+      "description": "Shown next to this server's threads and projects when more than one environment is set up. Empty uses the server's own name.",
+      "placeholder": "PC"
+    },
+    {
       "name": "appName",
       "type": "textfield",
       "required": false,

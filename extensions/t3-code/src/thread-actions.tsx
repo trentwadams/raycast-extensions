@@ -15,6 +15,7 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   dispatchCommand,
+  Environment,
   errorMessage,
   focusThread,
   ServerInfo,
@@ -52,8 +53,10 @@ const SHORTCUTS = {
   read: shortcut(["shift"], "u"),
 };
 
-/** Sends one command for the thread and reports the outcome; `onDone` reloads the list. */
+/** Sends one command to the thread's own environment and reports the outcome; `onDone`
+ * reloads the list. */
 async function run(
+  environment: Environment,
   thread: Thread,
   command: ThreadCommand,
   messages: { progress: string; done: string; failed: string },
@@ -65,7 +68,7 @@ async function run(
     title: messages.progress,
   });
   try {
-    await dispatchCommand({ threadId: thread.id, ...command });
+    await dispatchCommand(environment, { threadId: thread.id, ...command });
     toast.style = Toast.Style.Success;
     toast.title = messages.done;
     if (undo) {
@@ -73,6 +76,7 @@ async function run(
         title: undo.title,
         onAction: () =>
           run(
+            environment,
             thread,
             undo.command,
             {
@@ -93,10 +97,14 @@ async function run(
 }
 
 /** Opens the thread in T3 Code. The Raycast window closes first, so failures go to a HUD. */
-export async function openThread(thread: Thread, projectTitle?: string) {
+export async function openThread(
+  environment: Environment,
+  thread: Thread,
+  projectTitle?: string,
+) {
   await closeMainWindow();
   try {
-    const outcome = await focusThread({
+    const outcome = await focusThread(environment, {
       id: thread.id,
       title: thread.title,
       projectTitle,
@@ -113,6 +121,7 @@ export async function openThread(thread: Thread, projectTitle?: string) {
 }
 
 export function ThreadActions(props: {
+  environment: Environment;
   thread: Thread;
   projectTitle: string | undefined;
   section: Section;
@@ -121,7 +130,15 @@ export function ThreadActions(props: {
   snoozePresets: SnoozePresetSetting[];
   onChange: () => void;
 }) {
-  const { thread, projectTitle, section, status, server, onChange } = props;
+  const {
+    environment,
+    thread,
+    projectTitle,
+    section,
+    status,
+    server,
+    onChange,
+  } = props;
   const v2 = (server?.protocolVersion ?? 1) >= 2;
   const can = (capability: string) =>
     v2 && server?.capabilities[capability] === true;
@@ -131,7 +148,7 @@ export function ThreadActions(props: {
     command: ThreadCommand,
     messages: { progress: string; done: string; failed: string },
     undo?: { title: string; command: ThreadCommand },
-  ) => run(thread, command, messages, onChange, undo);
+  ) => run(environment, thread, command, messages, onChange, undo);
 
   async function approve() {
     if (!approval) {
@@ -184,13 +201,19 @@ export function ThreadActions(props: {
         <Action
           title="Open in T3 Code"
           icon={Icon.ArrowRight}
-          onAction={() => openThread(thread, projectTitle)}
+          onAction={() => openThread(environment, thread, projectTitle)}
         />
         {v2 ? (
           <Action.Push
             title="Reply"
             icon={Icon.Reply}
-            target={<ReplyForm thread={thread} onSent={onChange} />}
+            target={
+              <ReplyForm
+                environment={environment}
+                thread={thread}
+                onSent={onChange}
+              />
+            }
           />
         ) : null}
         {approval ? (
@@ -372,7 +395,13 @@ export function ThreadActions(props: {
             title="Rename"
             icon={Icon.Pencil}
             shortcut={Keyboard.Shortcut.Common.Edit}
-            target={<RenameForm thread={thread} onRenamed={onChange} />}
+            target={
+              <RenameForm
+                environment={environment}
+                thread={thread}
+                onRenamed={onChange}
+              />
+            }
           />
           <Action
             title="Archive"
@@ -455,7 +484,11 @@ function SnoozeMenu(props: {
   );
 }
 
-function ReplyForm(props: { thread: Thread; onSent: () => void }) {
+function ReplyForm(props: {
+  environment: Environment;
+  thread: Thread;
+  onSent: () => void;
+}) {
   const { pop } = useNavigation();
   const running = isRunning(props.thread);
   return (
@@ -477,6 +510,7 @@ function ReplyForm(props: { thread: Thread; onSent: () => void }) {
               }
               const messageId = randomUUID();
               await run(
+                props.environment,
                 props.thread,
                 {
                   type: "message.dispatch",
@@ -518,7 +552,11 @@ function ReplyForm(props: { thread: Thread; onSent: () => void }) {
   );
 }
 
-function RenameForm(props: { thread: Thread; onRenamed: () => void }) {
+function RenameForm(props: {
+  environment: Environment;
+  thread: Thread;
+  onRenamed: () => void;
+}) {
   const { pop } = useNavigation();
   return (
     <Form
@@ -535,6 +573,7 @@ function RenameForm(props: { thread: Thread; onRenamed: () => void }) {
                 return;
               }
               await run(
+                props.environment,
                 props.thread,
                 { type: "thread.metadata.update", title },
                 {

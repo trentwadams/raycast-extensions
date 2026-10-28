@@ -53,6 +53,7 @@ import {
   launchApp,
   launchThread,
   liveProjects,
+  loadEnvironments,
   MAX_ATTACHMENTS,
   modelChoices,
   modelKey,
@@ -199,15 +200,24 @@ export default function Command() {
   }
 
   const { data, isLoading, error, revalidate } = usePromise(async () => {
-    const snapshot = await getShell();
-    const names = await providerNames();
+    const [environment] = await loadEnvironments();
+    const snapshot = await getShell(environment);
+    const names = await providerNames(environment);
     const [models, lastProjectId, saved, appFavorites] = await Promise.all([
-      modelChoices(snapshot, names),
+      modelChoices(environment, snapshot, names),
       LocalStorage.getItem<string>(LAST_PROJECT_KEY),
       loadSavedPresets(),
-      t3Favorites(),
+      t3Favorites(environment),
     ]);
-    return { snapshot, models, lastProjectId, saved, names, appFavorites };
+    return {
+      environment,
+      snapshot,
+      models,
+      lastProjectId,
+      saved,
+      names,
+      appFavorites,
+    };
   });
 
   const projects = data ? liveProjects(data.snapshot) : [];
@@ -463,10 +473,10 @@ export default function Command() {
         );
       }
 
-      if ((await getProtocolVersion()) >= 2) {
+      if ((await getProtocolVersion(data.environment)) >= 2) {
         // v2 creates the thread, its worktree and the first message in one call.
         toast.title = "Sending prompt";
-        threadId = await launchThread({
+        threadId = await launchThread(data.environment, {
           projectId: project.id,
           title,
           prompt,
@@ -498,7 +508,7 @@ export default function Command() {
 
         toast.title = "Sending prompt";
         try {
-          threadId = await startSession({
+          threadId = await startSession(data.environment, {
             projectId: project.id,
             title,
             prompt,
@@ -544,7 +554,7 @@ export default function Command() {
       if (!options.focus) {
         return;
       }
-      const outcome = await focusThread({
+      const outcome = await focusThread(data.environment, {
         id: threadId,
         title,
         projectTitle: project.title,

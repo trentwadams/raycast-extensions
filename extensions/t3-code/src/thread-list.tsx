@@ -14,6 +14,7 @@ import {
   getShell,
   launchApp,
   liveProjects,
+  loadEnvironments,
   ShellSnapshot,
   snoozePresets,
   T3Error,
@@ -48,14 +49,15 @@ export default function ThreadList({
 }: Props) {
   const [filter, setFilter] = useState(ALL);
   const { data, isLoading, error, revalidate } = usePromise(async () => {
+    const [environment] = await loadEnvironments();
     const [snapshot, server, presets] = await Promise.all([
-      getShell(),
+      getShell(environment),
       // The list still works against a server that cannot describe itself; it just
       // offers no actions beyond opening and copying.
-      getServerInfo().catch(() => undefined),
-      snoozePresets(),
+      getServerInfo(environment).catch(() => undefined),
+      snoozePresets(environment),
     ]);
-    return { snapshot, server, presets };
+    return { environment, snapshot, server, presets };
   });
 
   if (error) {
@@ -63,6 +65,7 @@ export default function ThreadList({
   }
 
   const snapshot = data?.snapshot;
+  const environment = data?.environment;
   const projects = snapshot ? liveProjects(snapshot) : [];
   const projectTitles = new Map(projects.map((p) => [p.id, p.title]));
   const now = Date.now();
@@ -132,26 +135,29 @@ export default function ThreadList({
           title={section.title}
           subtitle={String(section.rows.length)}
         >
-          {section.rows.map(({ thread, section: id, status }) => (
-            <ThreadItem
-              key={thread.id}
-              thread={thread}
-              section={id}
-              status={status}
-              projectTitle={projectTitles.get(thread.projectId)}
-              actions={
-                <ThreadActions
-                  thread={thread}
-                  projectTitle={projectTitles.get(thread.projectId)}
-                  section={id}
-                  status={status}
-                  server={data?.server}
-                  snoozePresets={data?.presets ?? []}
-                  onChange={revalidate}
-                />
-              }
-            />
-          ))}
+          {section.rows.map(({ thread, section: id, status }) =>
+            environment ? (
+              <ThreadItem
+                key={thread.id}
+                thread={thread}
+                section={id}
+                status={status}
+                projectTitle={projectTitles.get(thread.projectId)}
+                actions={
+                  <ThreadActions
+                    environment={environment}
+                    thread={thread}
+                    projectTitle={projectTitles.get(thread.projectId)}
+                    section={id}
+                    status={status}
+                    server={data?.server}
+                    snoozePresets={data?.presets ?? []}
+                    onChange={revalidate}
+                  />
+                }
+              />
+            ) : null,
+          )}
         </List.Section>
       ))}
     </List>
