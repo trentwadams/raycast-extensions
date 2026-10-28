@@ -61,17 +61,18 @@ uses one `orchestration.launchThread` call over the WebSocket: it creates the th
 the worktree and sends the first message. Attachments are uploaded first through
 `attachments.createUploadUrl`. On v1 the images travel inside the turn as data URLs.
 
-Opening a thread activates T3 Code and drives its command palette, because the
-desktop app registers `t3code://` for its own auth callbacks and an external URL
-only reveals the window. The extension types the thread's title, project and
-branch, and presses Enter only when that query matches exactly one thread;
-otherwise the palette stays open on the narrowed list for you to pick from.
-macOS asks for Accessibility permission the first time.
+Opening a thread follows its deep link, `t3code://threads/<environmentId>/<threadId>`,
+which T3 Code 0.1.0 and later navigate to directly. The environment id comes from
+`/.well-known/t3/environment`. Older servers fall back to driving the command palette:
+the extension activates T3 Code, types the thread's title, project and branch, and
+presses Enter only when that query matches exactly one thread; otherwise the palette
+stays open on the narrowed list for you to pick from. macOS asks for Accessibility
+permission the first time the fallback runs.
 
-The app is found by release channel. The stable build is named `T3 Code (Alpha)` and the
-Nightly build `T3 Code (Nightly)`. With the `App Name` preference empty, the extension
-picks one from the running server's version, or from the installed apps when no server
-is running. Set the preference to override it.
+The app is found by release channel. The stable build is named `T3 Code (Beta)`
+(`T3 Code (Alpha)` before the rename) and the Nightly build `T3 Code (Nightly)`. With the
+`App Name` preference empty, the extension picks one from the running server's version, or
+from the installed apps when no server is running. Set the preference to override it.
 
 On v1 the extension creates worktrees itself with `git worktree add`, since the HTTP
 dispatch handler passes commands straight to the engine and never runs the

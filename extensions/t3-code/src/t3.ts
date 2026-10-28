@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { extname, basename, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { getPreferenceValues } from "@raycast/api";
+import { getPreferenceValues, open } from "@raycast/api";
 import { openRpc, RpcConnection } from "./rpc";
 
 const run = promisify(execFile);
@@ -82,6 +82,8 @@ export type ShellSnapshot = {
 };
 
 type EnvironmentDescriptor = {
+  /** The id the desktop app routes threads under: /<environmentId>/<threadId>. */
+  environmentId?: string;
   serverVersion?: string;
   /** Absent on servers that predate protocol v2. */
   orchestrationProtocolVersion?: number;
@@ -596,7 +598,9 @@ export function threadTitle(prompt: string): string {
 // The preference used to default to this, which matches neither release bundle, so a
 // stored copy counts as unset unless an app with that exact name is installed.
 const LEGACY_APP_NAME = "T3 Code";
-const STABLE_APP = "T3 Code (Alpha)";
+// The stable build was renamed from Alpha to Beta; an install that predates the rename
+// keeps the old bundle name.
+const STABLE_APPS = ["T3 Code (Beta)", "T3 Code (Alpha)"];
 const NIGHTLY_APP = "T3 Code (Nightly)";
 // Same pattern T3 uses to brand a build as Nightly. Preview builds share the branding.
 const NIGHTLY_VERSION = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/;
@@ -624,17 +628,28 @@ async function appName(): Promise<string> {
   ) {
     return configured;
   }
+  const stable = await installedStableApp();
   try {
     const { serverVersion } = await serverDescriptor(await resolveOrigin());
     if (serverVersion) {
-      return NIGHTLY_VERSION.test(serverVersion) ? NIGHTLY_APP : STABLE_APP;
+      return NIGHTLY_VERSION.test(serverVersion) ? NIGHTLY_APP : stable;
     }
   } catch {
     // the server is not running, so look at what is installed
   }
-  return (await isInstalled(STABLE_APP)) || !(await isInstalled(NIGHTLY_APP))
-    ? STABLE_APP
+  return (await isInstalled(stable)) || !(await isInstalled(NIGHTLY_APP))
+    ? stable
     : NIGHTLY_APP;
+}
+
+/** Whichever stable bundle name is installed, the current one when neither is. */
+async function installedStableApp(): Promise<string> {
+  for (const name of STABLE_APPS) {
+    if (await isInstalled(name)) {
+      return name;
+    }
+  }
+  return STABLE_APPS[0];
 }
 
 const escapeForAppleScript = (value: string) =>
@@ -690,14 +705,69 @@ export function paletteThreads(snapshot: ShellSnapshot): PaletteThread[] {
   }));
 }
 
-/** The desktop app registers t3code:// for Clerk callbacks only: an external URL
- * reveals the window but never navigates. So focus the app and drive its own
- * command palette with the thread's title, project and branch. The query is typed
- * first, then matches are counted against a shell snapshot fetched at that moment,
- * so a thread created since the list loaded still counts. Enter is pressed only
- * when exactly one thread matches and T3 Code is still frontmost; otherwise the
- * palette is left as it is and the result says why, so the caller can tell the user. */
+/** Desktop builds from 0.1.0 navigate to `t3code://threads/<environment>/<thread>`.
+ * The server and the desktop app ship together, so the server's version stands in
+ * for the app's. */
+const THREAD_LINK_MIN_VERSION = [0, 1, 0];
+
+function versionAtLeast(version: string, minimum: number[]): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version)?.slice(1).map(Number);
+  if (!parts) {
+    return false;
+  }
+  for (let index = 0; index < minimum.length; index++) {
+    if (parts[index] !== minimum[index]) {
+      return parts[index] > minimum[index];
+    }
+  }
+  return true;
+}
+
+export const threadLink = (environmentId: string, threadId: string) =>
+  `t3code://threads/${encodeURIComponent(environmentId)}/${encodeURIComponent(threadId)}`;
+
+/** The link that opens this thread in the desktop app, or undefined when the server
+ * is too old for the app to follow one, or cannot be asked. */
+export async function threadLinkFor(
+  threadId: string,
+): Promise<string | undefined> {
+  try {
+    const { environmentId, serverVersion } = await serverDescriptor(
+      await resolveOrigin(),
+    );
+    return environmentId &&
+      serverVersion &&
+      versionAtLeast(serverVersion, THREAD_LINK_MIN_VERSION)
+      ? threadLink(environmentId, threadId)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Opens the thread itself through its deep link. Servers too old for the app to
+ * follow one fall back to driving the command palette. */
 export async function focusThread(
+  target: PaletteThread,
+): Promise<"opened" | "ambiguous" | "unfocused"> {
+  const link = await threadLinkFor(target.id);
+  if (link) {
+    // Naming the app keeps the link in the channel this server belongs to when
+    // both the stable and Nightly builds are installed.
+    await open(link, await appName());
+    return "opened";
+  }
+  return focusThreadInPalette(target);
+}
+
+/** For desktop builds that only reveal their window for an external URL: focus the
+ * app and drive its own command palette with the thread's title, project and branch.
+ * The query is typed first, then matches are counted against a shell snapshot fetched
+ * at that moment, so a thread created since the list loaded still counts. Enter is
+ * pressed only when exactly one thread matches and T3 Code is still frontmost;
+ * otherwise the palette is left as it is and the result says why, so the caller can
+ * tell the user. */
+async function focusThreadInPalette(
   target: PaletteThread,
 ): Promise<"opened" | "ambiguous" | "unfocused"> {
   const query = paletteQuery(target);
