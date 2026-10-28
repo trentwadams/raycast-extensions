@@ -5,8 +5,10 @@ import {
   updateCommandMetadata,
 } from "@raycast/api";
 import {
-  getShell,
-  loadEnvironments,
+  EnvironmentFailure,
+  failureSummary,
+  loadShells,
+  PRIMARY_ENVIRONMENT,
   ShellSnapshot,
   T3Error,
   Thread,
@@ -57,6 +59,27 @@ function countThreads(snapshot: ShellSnapshot): StatusCounts {
   };
 }
 
+/** One set of counts across every environment that answered. */
+function sumCounts(all: StatusCounts[]): StatusCounts {
+  return {
+    needYou: all
+      .flatMap((counts) => counts.needYou)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    failed: all.reduce((sum, counts) => sum + counts.failed, 0),
+    done: all.reduce((sum, counts) => sum + counts.done, 0),
+    working: all.reduce((sum, counts) => sum + counts.working, 0),
+    waiting: all.reduce((sum, counts) => sum + counts.waiting, 0),
+  };
+}
+
+/** "Mac offline", so a quiet subtitle never hides an environment it could not read. */
+const failuresSuffix = (failures: EnvironmentFailure[]) =>
+  failures.length === 0
+    ? ""
+    : ` · ${failures
+        .map((failure) => `${failure.label} ${failureSummary(failure.error)}`)
+        .join(", ")}`;
+
 const truncate = (text: string, length: number) =>
   text.length > length ? `${text.slice(0, length - 1).trimEnd()}…` : text;
 
@@ -97,13 +120,23 @@ function errorSubtitle(error: unknown): string {
 }
 
 // A background run that throws marks the command with a warning in root search, so
-// every failure becomes the subtitle instead.
+// every failure becomes the subtitle instead. Counts are summed over the environments
+// that answered; only when none did does the subtitle become the error.
 export default async function Command() {
   let counts: StatusCounts | null = null;
   try {
-    const [environment] = await loadEnvironments();
-    counts = countThreads(await getShell(environment));
-    await updateCommandMetadata({ subtitle: statusSubtitle(counts) });
+    const { shells, failures } = await loadShells();
+    if (shells.length === 0) {
+      throw (
+        failures.find(
+          (failure) => failure.environment.key === PRIMARY_ENVIRONMENT,
+        ) ?? failures[0]
+      ).error;
+    }
+    counts = sumCounts(shells.map((shell) => countThreads(shell.snapshot)));
+    await updateCommandMetadata({
+      subtitle: statusSubtitle(counts) + failuresSuffix(failures),
+    });
   } catch (error) {
     await updateCommandMetadata({ subtitle: errorSubtitle(error) }).catch(
       () => undefined,
