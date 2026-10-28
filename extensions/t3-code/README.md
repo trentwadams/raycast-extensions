@@ -1,11 +1,14 @@
 # T3 Code for Raycast
 
-Four commands against the T3 Code server running on this computer, on macOS or Windows.
+Commands for the T3 Code server running on this computer, on macOS or Windows, and for as many
+servers on other computers as you add, such as a Mac on your tailnet. See
+[More environments](#more-environments).
 
 - **Prompt T3 Code** — write a prompt, attach files, pick a preset (project, model, permissions and workspace), optionally branch into a git worktree. Creates the thread, sends the prompt, opens the thread in T3 Code.
 - **Waiting T3 Threads** — pinned and active threads whose agent has stopped, so the next move is yours.
 - **Search T3 Threads** — every thread, grouped the way T3's sidebar groups them, with the actions T3 offers.
 - **T3 Code Status** — shows in root search what needs you, what finished and what is working, refreshed every minute in the background.
+- **Manage T3 Environments** — adds, edits and tests the T3 Code servers on your other computers.
 
 ## Threads
 
@@ -14,6 +17,12 @@ Snoozed and Settled, and show T3's status for each: Pending Approval, Awaiting I
 Guest Request, Working, Connecting, Waiting, Failed, Plan Ready or Completed. Subagent
 threads stay under their parent, as in the sidebar. The dropdown narrows the list to one
 section or one project, and the search matches title, project, branch and status.
+
+With more than one environment, the threads of all of them are listed together. Each row
+is tagged with its environment's name, and the dropdown can narrow the list to one
+environment. An environment that can't be reached, or rejects its token, gets a row under
+Unavailable with the reason, and the others are listed as usual. That row also opens Manage T3
+Environments.
 
 `↵` opens the thread in T3 Code. On protocol v2 servers the action panel also acts on it:
 
@@ -27,7 +36,8 @@ section or one project, and the search matches title, project, branch and status
   from the toast.
 - **Copy Thread Link** copies the `t3code://` link that opens the thread.
 
-An action only shows when the server reports the capability it needs.
+An action only shows when the server reports the capability it needs. Every action goes to
+the server the thread is on.
 
 ## T3 Code Status
 
@@ -38,6 +48,9 @@ finished runs you haven't opened, blue for running agents. Idle threads only sho
 else does, otherwise it reads `All quiet`. Opening it shows Waiting T3 Threads when something
 needs you, and Search T3 Threads otherwise. Raycast turns background refresh on the first time
 you open the command.
+
+With more than one environment the counts are added up, and an environment that can't be read
+is named at the end, as in `🟢 1 done · Mac offline`.
 
 ## Prompt T3 Code
 
@@ -52,8 +65,11 @@ you open the command.
   unstars them. Choose Custom… for the separate fields. Model names show the provider and effort,
   for example `Claude · Sonnet 5.5 · high · 1M`.
 - `↵` sends and opens the thread in T3 Code. `⌘⇧↵` (`Ctrl+Shift+↵`) sends and leaves T3 Code alone.
-- Worktrees need the project folder on this computer, because the base branch is read from its git
-  repository.
+- **Project** lists the projects of every environment, grouped by environment when there is more
+  than one, and presets start with the environment's name. The thread starts on the project's own
+  server, with that server's models, and attached files are uploaded to it.
+- Worktrees for a project on this computer branch from the default branch of its local clone.
+  For a project on another environment, that server picks its repository's default branch.
 
 ## Setup
 
@@ -90,15 +106,67 @@ The server origin comes from `~/.t3/userdata/server-runtime.json` unless the
 `Server Origin` preference is set, so a restarted server on a new port needs no
 reconfiguration.
 
+### More environments
+
+Manage T3 Environments adds T3 Code servers on other computers, as many as you like. This
+computer stays the one set up in the extension preferences, so with a single machine you never
+need the command. Add Environment asks for a name, the server's origin and an access token. The
+name tags the environment's threads and projects; left empty, the server's own name is used.
+`Environment Name` in the preferences does the same for this computer. The environments are kept
+in Raycast's encrypted local storage, and every command lists them in the order set there.
+
+Each row shows whether its server answers, with the server's name and version, or why it can't
+be read: offline, token rejected, or needs https. Saving tests the connection the same way and
+offers to save anyway when it fails. A server that is already listed is refused, also under
+another address when both answer.
+
+The token only ever goes over HTTPS or to a loopback address, so a server on another machine
+needs an HTTPS origin. With Tailscale, run this on the Mac:
+
+```
+tailscale serve --bg 3773
+```
+
+That serves the Mac's T3 Code at `https://<mac>.<tailnet>.ts.net` on your tailnet. Use that as
+the origin. `t3 serve --tailscale-serve` sets the same thing up when starting a headless server.
+Then issue a token on the Mac, with the commands above or directly:
+
+```
+t3 auth session issue --ttl 365d --label raycast --scope orchestration:read --scope orchestration:operate --token-only
+```
+
+and paste it into Access Token.
+
+Instead of a token, a pairing link works too. Run this on the Mac:
+
+```
+t3 auth pairing create --scope orchestration:read --scope orchestration:operate --base-url https://<mac>.<tailnet>.ts.net
+```
+
+and paste the link it prints, or a `t3code://pair` link, into Pairing Link. The origin is taken
+from the link when the field is left empty. The extension exchanges the link once for a token
+with only the read and operate scopes. T3 gives a token from a pairing link 30 days, after which
+the environment shows token rejected until you pair again or paste a 365-day token.
+
+Opening a thread from another environment uses that environment's id in the `t3code://` link.
+T3 Code on this computer can only open it after you have paired it with that environment, for
+example with Add environment in T3 Code, pairing it with the Mac. Every other action talks to the
+thread's server directly and works either way.
+
 ## How it talks to T3
 
-Everything runs against the T3 Code server on this machine, over loopback:
+Every request goes to one environment's server, the one the thread or project is on:
 
 - `GET /api/orchestration/shell` for projects and threads.
-- `GET /.well-known/t3/environment` for the server's orchestration protocol version.
+- `GET /.well-known/t3/environment` for the server's orchestration protocol version, and its
+  environment id when an environment is added.
 - `GET /api/auth/websocket-ticket`, then a WebSocket to `/ws`, for creating threads and acting on
   them on protocol v2.
 - `POST /api/orchestration/dispatch` for `thread.create` and `thread.turn.start` on protocol v1.
+- `POST /oauth/token`, once, to exchange a pairing link for a token.
+
+The commands read every environment at the same time, and one that fails is reported without
+holding up the rest.
 
 On protocol v2 the extension sends the `x-t3-orchestration-protocol` header and maps the
 v2 thread fields onto the v1 shape. v2 removed thread creation over HTTP, so Prompt T3 Code
@@ -123,11 +191,19 @@ from the installed apps when no server is running. Set the preference to overrid
 On v1 the extension creates worktrees itself with `git worktree add`, since the HTTP
 dispatch handler passes commands straight to the engine and never runs the
 server's worktree bootstrap. The path matches T3's own convention,
-`~/.t3/worktrees/<repo>/<branch>`. On v2 the server prepares the worktree.
+`~/.t3/worktrees/<repo>/<branch>`. On v2 the server prepares the worktree. It needs a
+base branch: for a project on this machine the extension reads it from the local clone, and for
+one on another environment it asks that server with `vcs.listRefs`, which marks the
+repository's default branch. On another environment that is still on v1, worktrees aren't
+offered from Raycast; choose Local.
 
 The preset list comes from the threads you ran recently, so the extension carries no model
 list of its own. Provider names, custom models, starred models and snooze presets are read
-from `~/.t3/userdata/settings.json` and `model-manifest.json`, read-only.
+from `~/.t3/userdata/settings.json` and `model-manifest.json`, read-only. Those files belong to
+this computer's install, so they are only used for the server whose environment id matches
+`~/.t3/userdata/environment-id`. Any other environment is asked for its settings and models
+with `server.getConfig` on protocol v2, and otherwise gets T3's default snooze presets and the
+models its threads already use.
 
 ## Development
 

@@ -1,5 +1,13 @@
 # T3 Code Changelog
 
+## [Multiple environments] - {PR_MERGE_DATE}
+
+- Manage T3 Environments adds T3 Code servers on other computers, such as a Mac on your tailnet, as many as you like. Each has a name, an HTTPS or loopback origin, and an access token or a pairing link. Each shows whether it answers, and saving tests the connection and refuses a server that is already listed. This computer stays in the extension preferences, so nothing needs to change.
+- Search T3 Threads and Waiting T3 Threads list the threads of every environment together, tagged with the environment's name, and the dropdown filters by environment. Every action goes to the thread's own server. An environment that can't be reached gets a row with the reason instead of hiding the rest.
+- Prompt T3 Code lists the projects of every environment and starts the thread on the project's own server, with that server's models. Attachments are uploaded there, and presets remember their environment. For a project on another machine, a new worktree branches from that server's default branch.
+- T3 Code Status adds up the counts of every environment and names the ones it can't read, as in `🟢 1 done · Mac offline`.
+- An optional Environment Name preference names the first server too.
+
 ## [Windows, thread actions and a status command] - {PR_MERGE_DATE}
 
 - Windows support for every command. T3 Code is launched from its install folder, clipboard screenshots attach, and shortcuts use Ctrl.
