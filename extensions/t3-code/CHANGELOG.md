@@ -7,6 +7,7 @@
 - Search T3 Threads and Waiting T3 Threads group threads into T3's sidebar sections (Pinned, Working, Active, Snoozed, Settled) with T3's status for each, and a dropdown filters by section or project. Subagent threads stay under their parent.
 - New thread actions: Reply, Approve and Decline a pending request, Stop, Settle, Snooze with your T3 presets, Pin, Mark as Read or Unread, Rename, Archive and Delete, plus Copy Thread Link.
 - New T3 Code Status command: a root search subtitle such as `🟠 2 need you · 🟢 1 done · 🔵 3 working`, refreshed every minute in the background.
+- Attach from Clipboard also attaches files copied in Finder or File Explorer, several at once. On Windows it is `Ctrl+Shift+P`, since `Ctrl+Shift+V` is Paste as Plain Text there.
 - The stable build's new name, T3 Code (Beta), is recognised.
 - The setup instructions issue a token with only the scopes the extension uses.
 

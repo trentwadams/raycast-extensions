@@ -106,3 +106,59 @@ export async function clipboardImagePath(): Promise<string | undefined> {
   }
   return undefined;
 }
+
+/** File Explorer puts copied files on the clipboard as a drop list, which .NET reads in
+ * full, so copying several files attaches them all. One path per line on stdout. */
+const READ_CLIPBOARD_FILES_WINDOWS = `
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Clipboard]::GetFileDropList() | ForEach-Object { $_ }`;
+
+async function copiedFiles(): Promise<string[]> {
+  if (isWindows) {
+    try {
+      const { stdout } = await run(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-STA",
+          "-Command",
+          READ_CLIPBOARD_FILES_WINDOWS,
+        ],
+        { windowsHide: true },
+      );
+      return stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+  try {
+    const { file } = await Clipboard.read();
+    return file ? [file.startsWith("file:") ? fileURLToPath(file) : file] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** What the clipboard holds as attachments: a screenshot or copied image, or else any
+ * files copied in Finder or File Explorer. Folders are skipped. */
+export async function clipboardFilePaths(): Promise<string[]> {
+  const image = await clipboardImagePath();
+  if (image) {
+    return [image];
+  }
+  const files: string[] = [];
+  for (const path of await copiedFiles()) {
+    try {
+      if ((await stat(path)).isFile()) {
+        files.push(path);
+      }
+    } catch {
+      // a copied file that has since moved cannot be attached
+    }
+  }
+  return files;
+}

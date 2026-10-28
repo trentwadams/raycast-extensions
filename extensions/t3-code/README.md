@@ -43,8 +43,10 @@ you open the command.
 
 - **Files** take any file type, up to 8 per prompt: images up to 10 MB, other files up to 50 MB.
   A screenshot on the clipboard is attached when the command opens, unless it was already sent.
-  `⌘⇧V` (`Ctrl+Shift+V` on Windows) attaches one copied later, `⌘⇧A` (`Ctrl+Shift+A`) attaches the
-  files selected in Finder or File Explorer, and `⌘Y` (`Ctrl+Y`) previews what is attached. Protocol v1 servers accept images only.
+  `⌘⇧V` (`Ctrl+Shift+P` on Windows, where `Ctrl+Shift+V` is Paste as Plain Text) attaches a
+  screenshot copied later, or the files copied in Finder or File Explorer. `⌘⇧A` (`Ctrl+Shift+A`)
+  attaches the files selected there, and `⌘Y` (`Ctrl+Y`) previews what is attached. Protocol v1
+  servers accept images only.
 - **Preset** is the project, model, permissions and workspace in one choice. Starred presets come
   first, then the combinations you used recently. `⌘D` stars the current settings, and again
   unstars them. Choose Custom… for the separate fields. Model names show the provider and effort,

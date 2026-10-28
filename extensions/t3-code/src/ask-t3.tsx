@@ -22,7 +22,11 @@ import { stat } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { ErrorView } from "./thread-list";
-import { clipboardHash, clipboardImagePath } from "./clipboard";
+import {
+  clipboardFilePaths,
+  clipboardHash,
+  clipboardImagePath,
+} from "./clipboard";
 import {
   CUSTOM_PRESET,
   loadSavedPresets,
@@ -86,9 +90,10 @@ const SEND_IN_BACKGROUND: Keyboard.Shortcut = {
   macOS: { modifiers: ["cmd", "shift"], key: "return" },
   Windows: { modifiers: ["ctrl", "shift"], key: "return" },
 };
-const PASTE_IMAGE: Keyboard.Shortcut = {
+// Ctrl+Shift+V is Paste as Plain Text in most Windows apps, so Windows gets P for paste.
+const PASTE_FILES: Keyboard.Shortcut = {
   macOS: { modifiers: ["cmd", "shift"], key: "v" },
-  Windows: { modifiers: ["ctrl", "shift"], key: "v" },
+  Windows: { modifiers: ["ctrl", "shift"], key: "p" },
 };
 const ATTACH_SELECTION: Keyboard.Shortcut = {
   macOS: { modifiers: ["cmd", "shift"], key: "a" },
@@ -96,7 +101,7 @@ const ATTACH_SELECTION: Keyboard.Shortcut = {
 };
 const KEYS = isWindows
   ? {
-      paste: "Ctrl+Shift+V",
+      paste: "Ctrl+Shift+P",
       attach: "Ctrl+Shift+A",
       preview: "Ctrl+Y",
       star: "Ctrl+Shift+S",
@@ -170,22 +175,26 @@ export default function Command() {
     })();
   }, []);
 
-  async function pasteClipboardImage() {
-    const path = await clipboardImagePath();
-    if (!path) {
+  async function attachClipboard() {
+    const paths = await clipboardFilePaths();
+    if (paths.length === 0) {
       await showToast({
         style: Toast.Style.Failure,
-        title: "No image on the clipboard",
-        message: "Copy a screenshot or an image file first.",
+        title: "Nothing to attach on the clipboard",
+        message: `Copy a screenshot, or copy files in ${FILE_MANAGER}, first.`,
       });
       return;
     }
-    setFiles((current) =>
-      current.includes(path) ? current : [...current, path],
-    );
+    setFiles((current) => [
+      ...current,
+      ...paths.filter((path) => !current.includes(path)),
+    ]);
     await showToast({
       style: Toast.Style.Success,
-      title: "Attached the clipboard image",
+      title:
+        paths.length === 1
+          ? `Attached ${basename(paths[0])}`
+          : `Attached ${paths.length} files`,
     });
   }
 
@@ -606,10 +615,10 @@ export default function Command() {
             }
           />
           <Action
-            title="Paste Clipboard Image"
+            title="Attach from Clipboard"
             icon={Icon.Clipboard}
-            shortcut={PASTE_IMAGE}
-            onAction={pasteClipboardImage}
+            shortcut={PASTE_FILES}
+            onAction={attachClipboard}
           />
           <Action
             title={`Attach ${FILE_MANAGER} Selection`}
@@ -659,7 +668,7 @@ export default function Command() {
         onChange={setFiles}
         allowMultipleSelection
         canChooseDirectories={false}
-        info={`Any file, up to 8: images to 10 MB, others to 50 MB. A screenshot on the clipboard is attached when this opens. ${KEYS.paste} attaches one copied later, ${KEYS.attach} the ${FILE_MANAGER} selection, ${KEYS.preview} previews.`}
+        info={`Any file, up to 8: images to 10 MB, others to 50 MB. A screenshot on the clipboard is attached when this opens. ${KEYS.paste} attaches a copied screenshot or files, ${KEYS.attach} the ${FILE_MANAGER} selection, ${KEYS.preview} previews.`}
       />
       <Form.Dropdown
         id="preset"
