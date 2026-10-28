@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ErrorView } from "./thread-list";
+import { allFailedError, ErrorView } from "./thread-list";
 import {
   clipboardFilePaths,
   clipboardHash,
@@ -31,6 +31,7 @@ import {
   CUSTOM_PRESET,
   loadSavedPresets,
   Preset,
+  presetEnvironment,
   presetLabel,
   recentPresets,
   sameSettings,
@@ -41,9 +42,9 @@ import {
   createWorktree,
   defaultBaseBranch,
   errorMessage,
+  failureSummary,
   focusThread,
   getProtocolVersion,
-  getShell,
   hasOriginRemote,
   AttachmentFile,
   isWindows,
@@ -52,8 +53,9 @@ import {
   isFavoriteModel,
   launchApp,
   launchThread,
+  isThisMachine,
   liveProjects,
-  loadEnvironments,
+  loadShells,
   MAX_ATTACHMENTS,
   modelChoices,
   modelKey,
@@ -63,6 +65,7 @@ import {
   removeWorktree,
   RUNTIME_MODES,
   RuntimeMode,
+  serverBaseRef,
   startSession,
   t3Favorites,
   ThreadEnvMode,
@@ -113,6 +116,11 @@ const LAST_PROJECT_KEY = "last-project-id";
 const LAST_CLIPBOARD_KEY = "last-sent-clipboard-hash";
 const FAVORITE_MODELS_KEY = "favorite-models";
 
+/** Project ids are only unique within one environment, so the form names a project
+ * by both. */
+const projectRef = (environmentKey: string, projectId: string) =>
+  `${environmentKey}:${projectId}`;
+
 export default function Command() {
   const [projectId, setProjectId] = useState<string>();
   const [selectedModel, setSelectedModel] = useState<string>();
@@ -122,7 +130,7 @@ export default function Command() {
   // Keyed by project: an unkeyed cache still reads as valid for the moment
   // between switching projects and the effect resolving the new one.
   const [baseBranch, setBaseBranch] = useState<{
-    projectId: string;
+    projectRef: string;
     branch: string;
   }>();
   const [submitting, setSubmitting] = useState(false);
@@ -200,49 +208,98 @@ export default function Command() {
   }
 
   const { data, isLoading, error, revalidate } = usePromise(async () => {
-    const [environment] = await loadEnvironments();
-    const snapshot = await getShell(environment);
-    const names = await providerNames(environment);
-    const [models, lastProjectId, saved, appFavorites] = await Promise.all([
-      modelChoices(environment, snapshot, names),
+    const { environments, shells, failures } = await loadShells();
+    if (shells.length === 0) {
+      throw allFailedError(failures);
+    }
+    // Each environment has its own models, provider names and starred models.
+    const sources = await Promise.all(
+      shells.map(async (shell) => {
+        const names = await providerNames(shell.environment);
+        const [models, appFavorites, local] = await Promise.all([
+          modelChoices(shell.environment, shell.snapshot, names),
+          t3Favorites(shell.environment),
+          isThisMachine(shell.environment),
+        ]);
+        return {
+          ...shell,
+          key: shell.environment.key,
+          names,
+          models,
+          appFavorites,
+          local,
+        };
+      }),
+    );
+    const [lastProjectId, saved] = await Promise.all([
       LocalStorage.getItem<string>(LAST_PROJECT_KEY),
       loadSavedPresets(),
-      t3Favorites(environment),
     ]);
     return {
-      environment,
-      snapshot,
-      models,
+      multiple: environments.length > 1,
+      sources,
+      failures,
       lastProjectId,
       saved,
-      names,
-      appFavorites,
     };
   });
 
-  const projects = data ? liveProjects(data.snapshot) : [];
+  // The other environments still work, so one that is down is a toast, not an error.
+  useEffect(() => {
+    if (!data || data.failures.length === 0) {
+      return;
+    }
+    void showToast({
+      style: Toast.Style.Failure,
+      title: data.failures
+        .map((failure) => `${failure.label} ${failureSummary(failure.error)}`)
+        .join(", "),
+      message: data.failures
+        .map((failure) => `${failure.label}: ${errorMessage(failure.error)}`)
+        .join("\n"),
+    });
+  }, [data]);
+
+  const sources = data?.sources ?? [];
+  const multiple = data?.multiple ?? false;
+  const projects = sources.flatMap((source) =>
+    liveProjects(source.snapshot).map((project) => ({
+      ref: projectRef(source.key, project.id),
+      source,
+      project,
+    })),
+  );
+  // The stored project is a bare id from before there were several environments.
   const activeProjectId =
     projectId ??
-    projects.find((project) => project.id === data?.lastProjectId)?.id ??
-    projects[0]?.id;
+    projects.find(
+      ({ ref, project }) =>
+        ref === data?.lastProjectId || project.id === data?.lastProjectId,
+    )?.ref ??
+    projects[0]?.ref;
+  const active = projects.find(({ ref }) => ref === activeProjectId);
+  const sourceFor = (preset: Preset) =>
+    sources.find((source) => source.key === presetEnvironment(preset));
 
   function applyPreset(preset: Preset) {
-    setProjectId(preset.projectId);
+    setProjectId(projectRef(presetEnvironment(preset), preset.projectId));
     setSelectedModel(preset.modelKey);
     setRuntimeMode(preset.runtimeMode);
     setEnvMode(preset.envMode);
     setPresetValue(preset.id);
   }
 
-  // The first preset is whatever this machine ran last, the way opening the composer
-  // in T3 would. A saved preset with the same settings wins, so its star shows.
+  // The first preset is whatever ran last, the way opening the composer in T3 would.
+  // A saved preset with the same settings wins, so its star shows. Every saved preset
+  // is kept in state, so starring while an environment is offline does not drop that
+  // environment's presets from storage.
   useEffect(() => {
     if (!data || presetValue !== undefined) {
       return;
     }
-    const saved = usableSaved(data.saved, data.snapshot);
-    setSavedPresets(saved);
-    const newest = recentPresets(data.snapshot)[0];
+    setSavedPresets(data.saved);
+    const saved = usableSaved(data.saved, data.sources);
+    const newest = recentPresets(data.sources)[0];
     if (newest) {
       applyPreset(
         saved.find((preset) => sameSettings(preset, newest)) ?? newest,
@@ -257,15 +314,16 @@ export default function Command() {
   }, [data]);
 
   // Picking a project in the custom fields starts from what that project last used.
-  function changeProject(id: string) {
-    setProjectId(id);
-    if (!data) {
+  function changeProject(ref: string) {
+    setProjectId(ref);
+    const target = projects.find((candidate) => candidate.ref === ref);
+    if (!target) {
       return;
     }
     const inherited = inheritedSettings(
-      data.snapshot,
-      id,
-      data.models[0]?.selection,
+      target.source.snapshot,
+      target.project.id,
+      target.source.models[0]?.selection,
     );
     setSelectedModel(
       inherited.modelSelection ? modelKey(inherited.modelSelection) : undefined,
@@ -274,21 +332,18 @@ export default function Command() {
     setEnvMode(inherited.envMode);
   }
 
+  // Only a project on this machine has a repository git can read here; another
+  // environment's server picks the base when the session starts.
   useEffect(() => {
-    if (!data || !activeProjectId) {
+    if (!active?.source.local) {
       return;
     }
-    const project = data.snapshot.projects.find(
-      (candidate) => candidate.id === activeProjectId,
-    );
-    if (!project) {
-      return;
-    }
+    const { ref, project } = active;
     let cancelled = false;
     setBaseBranch(undefined);
     void defaultBaseBranch(project.workspaceRoot).then((branch) => {
       if (!cancelled) {
-        setBaseBranch({ projectId: project.id, branch });
+        setBaseBranch({ projectRef: ref, branch });
       }
     });
     return () => {
@@ -298,16 +353,18 @@ export default function Command() {
 
   /** One key stars the current settings, and the same key unstars them. */
   async function toggleStarPreset() {
-    if (!activeProjectId || !selectedModel) {
+    if (!active || !selectedModel) {
       return;
     }
     const current: Preset = {
       id: "",
-      projectId: activeProjectId,
+      environmentKey: active.source.key,
+      projectId: active.project.id,
       modelKey: selectedModel,
       // Kept with its original types: a key alone turns every option into text.
-      selection: data?.models.find((choice) => choice.key === selectedModel)
-        ?.selection,
+      selection: active.source.models.find(
+        (choice) => choice.key === selectedModel,
+      )?.selection,
       runtimeMode,
       envMode,
       saved: true,
@@ -357,15 +414,16 @@ export default function Command() {
     }
   }
 
-  const recents = data ? recentPresets(data.snapshot) : [];
-  const savedList = data ? usableSaved(savedPresets, data.snapshot) : [];
+  const recents = recentPresets(sources);
+  const savedList = usableSaved(savedPresets, sources);
   const recentList = recents.filter(
     (recent) => !savedList.some((saved) => sameSettings(saved, recent)),
   );
   const allPresets = [...savedList, ...recentList];
   const starred = savedPresets.some(
     (saved) =>
-      saved.projectId === activeProjectId &&
+      projectRef(presetEnvironment(saved), saved.projectId) ===
+        activeProjectId &&
       saved.modelKey === selectedModel &&
       saved.runtimeMode === runtimeMode &&
       saved.envMode === envMode,
@@ -387,10 +445,12 @@ export default function Command() {
     }
   }
 
-  const choices = data?.models ?? [];
+  // The models, and the stars set in T3, of the environment the project is on.
+  const choices = active?.source.models ?? [];
+  const appFavorites = active?.source.appFavorites ?? [];
   // Stars set in the T3 app show here too; stars set here stay in this extension.
   const isStarred = (key: string) =>
-    favorites.includes(key) || isFavoriteModel(key, data?.appFavorites ?? []);
+    favorites.includes(key) || isFavoriteModel(key, appFavorites);
   const favoriteChoices = choices.filter((choice) => isStarred(choice.key));
   const otherChoices = choices.filter((choice) => !isStarred(choice.key));
 
@@ -398,11 +458,23 @@ export default function Command() {
     return <ErrorView error={error} onRetry={revalidate} />;
   }
 
+  function labelFor(preset: Preset): string {
+    const source = sourceFor(preset);
+    return source
+      ? presetLabel(
+          preset,
+          source.snapshot,
+          source.names,
+          multiple ? source.label : undefined,
+        )
+      : preset.id;
+  }
+
   async function submit(
     values: PromptValues,
     options: { focus: boolean } = { focus: true },
   ) {
-    if (!data || !activeProjectId || sending.current) {
+    if (!data || !active || sending.current) {
       return;
     }
     const prompt = values.prompt.trim();
@@ -420,20 +492,19 @@ export default function Command() {
       });
       return;
     }
-    const project = data.snapshot.projects.find(
-      (candidate) => candidate.id === activeProjectId,
-    );
-    if (!project) {
-      await showToast({ style: Toast.Style.Failure, title: "Pick a project" });
-      return;
-    }
+    const { source, project } = active;
+    const { environment } = source;
     const branch = (values.branch ?? "").trim();
     if (envMode === "worktree" && !branch) {
       setBranchError("Required for a worktree");
       return;
     }
 
-    if (envMode === "worktree" && !existsSync(project.workspaceRoot)) {
+    if (
+      envMode === "worktree" &&
+      source.local &&
+      !existsSync(project.workspaceRoot)
+    ) {
       await showToast({
         style: Toast.Style.Failure,
         title: "Worktrees need the project on this computer",
@@ -457,15 +528,15 @@ export default function Command() {
         files.map(readAttachment),
       );
       const modelSelection = selectedModel
-        ? (data.models.find((choice) => choice.key === selectedModel)
+        ? (source.models.find((choice) => choice.key === selectedModel)
             ?.selection ??
           savedPresets.find((preset) => preset.modelKey === selectedModel)
             ?.selection ??
           parseModelKey(selectedModel))
         : inheritedSettings(
-            data.snapshot,
+            source.snapshot,
             project.id,
-            data.models[0]?.selection,
+            source.models[0]?.selection,
           ).modelSelection;
       if (!modelSelection) {
         throw new Error(
@@ -473,24 +544,43 @@ export default function Command() {
         );
       }
 
-      if ((await getProtocolVersion(data.environment)) >= 2) {
+      const v2 = (await getProtocolVersion(environment)) >= 2;
+      if (envMode === "worktree" && !source.local && !v2) {
+        throw new Error(
+          `${source.label} runs a T3 Code too old to make a worktree from here. Choose Local, or update T3 Code there.`,
+        );
+      }
+      if (v2) {
         // v2 creates the thread, its worktree and the first message in one call.
         toast.title = "Sending prompt";
-        threadId = await launchThread(data.environment, {
+        threadId = await launchThread(environment, {
           projectId: project.id,
           title,
           prompt,
           modelSelection,
           runtimeMode,
           workspace:
-            envMode === "worktree"
-              ? {
-                  type: "worktree",
-                  branch,
-                  baseRef: await defaultBaseBranch(project.workspaceRoot),
-                  startFromOrigin: await hasOriginRemote(project.workspaceRoot),
-                }
-              : { type: "root" },
+            envMode !== "worktree"
+              ? { type: "root" }
+              : source.local
+                ? {
+                    type: "worktree",
+                    branch,
+                    baseRef: await defaultBaseBranch(project.workspaceRoot),
+                    startFromOrigin: await hasOriginRemote(
+                      project.workspaceRoot,
+                    ),
+                  }
+                : // The repository is on the other machine, so its server says
+                  // which branch is the default.
+                  {
+                    type: "worktree",
+                    branch,
+                    ...(await serverBaseRef(
+                      environment,
+                      project.workspaceRoot,
+                    )),
+                  },
           attachments,
         });
       } else {
@@ -508,7 +598,7 @@ export default function Command() {
 
         toast.title = "Sending prompt";
         try {
-          threadId = await startSession(data.environment, {
+          threadId = await startSession(environment, {
             projectId: project.id,
             title,
             prompt,
@@ -533,7 +623,7 @@ export default function Command() {
           await LocalStorage.setItem(LAST_CLIPBOARD_KEY, hash);
         }
       }
-      await LocalStorage.setItem(LAST_PROJECT_KEY, project.id);
+      await LocalStorage.setItem(LAST_PROJECT_KEY, active.ref);
     } catch (submitError) {
       toast.style = Toast.Style.Failure;
       toast.title = "Could not start the session";
@@ -554,7 +644,7 @@ export default function Command() {
       if (!options.focus) {
         return;
       }
-      const outcome = await focusThread(data.environment, {
+      const outcome = await focusThread(environment, {
         id: threadId,
         title,
         projectTitle: project.title,
@@ -651,7 +741,7 @@ export default function Command() {
             onAction={toggleStarPreset}
           />
           {presetValue === CUSTOM_PRESET &&
-          !isFavoriteModel(selectedModel ?? "", data?.appFavorites ?? []) ? (
+          !isFavoriteModel(selectedModel ?? "", appFavorites) ? (
             <Action
               title={
                 selectedModel && isStarred(selectedModel)
@@ -693,7 +783,7 @@ export default function Command() {
               <Form.Dropdown.Item
                 key={preset.id}
                 value={preset.id}
-                title={presetLabel(preset, data!.snapshot, data!.names)}
+                title={labelFor(preset)}
                 icon={{ source: Icon.Star, tintColor: Color.Yellow }}
               />
             ))}
@@ -705,7 +795,7 @@ export default function Command() {
               <Form.Dropdown.Item
                 key={preset.id}
                 value={preset.id}
-                title={presetLabel(preset, data!.snapshot, data!.names)}
+                title={labelFor(preset)}
               />
             ))}
           </Form.Dropdown.Section>
@@ -726,12 +816,21 @@ export default function Command() {
             value={activeProjectId}
             onChange={changeProject}
           >
-            {projects.map((project) => (
-              <Form.Dropdown.Item
-                key={project.id}
-                value={project.id}
-                title={project.title}
-              />
+            {sources.map((projectSource) => (
+              <Form.Dropdown.Section
+                key={projectSource.key}
+                title={multiple ? projectSource.label : undefined}
+              >
+                {projects
+                  .filter(({ source }) => source === projectSource)
+                  .map(({ ref, project }) => (
+                    <Form.Dropdown.Item
+                      key={ref}
+                      value={ref}
+                      title={project.title}
+                    />
+                  ))}
+              </Form.Dropdown.Section>
             ))}
           </Form.Dropdown>
           <Form.Dropdown
@@ -804,11 +903,15 @@ export default function Command() {
           placeholder="MKT-1234-short-slug"
           error={branchError}
           onChange={() => setBranchError(undefined)}
-          info={`Branched from ${
-            baseBranch?.projectId === activeProjectId
-              ? `origin/${baseBranch.branch}`
-              : "the repository default branch"
-          } into ~/.t3/worktrees/<repo>/<branch>.`}
+          info={
+            active && !active.source.local
+              ? `Branched from the repository's default branch, in a worktree on ${active.source.label}.`
+              : `Branched from ${
+                  baseBranch?.projectRef === activeProjectId
+                    ? `origin/${baseBranch.branch}`
+                    : "the repository default branch"
+                } into ~/.t3/worktrees/<repo>/<branch>.`
+          }
         />
       ) : null}
     </Form>
