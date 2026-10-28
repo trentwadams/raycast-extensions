@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { getPreferenceValues, open } from "@raycast/api";
 import { openRpc, RpcConnection } from "./rpc";
+import { DEFAULT_SNOOZE_PRESETS, SnoozePresetSetting } from "./thread-state";
 
 const run = promisify(execFile);
 
@@ -72,6 +73,27 @@ export type Thread = {
   status?: string;
   activeRunId?: string | null;
   lastError?: string | null;
+  /** Protocol v2 run, request and sidebar state; thread-state.ts reads them the way
+   * T3's sidebar does. */
+  latestRunId?: string | null;
+  latestRunCompletedAt?: string | null;
+  activityRunStatus?: string | null;
+  activeProviderThreadId?: string | null;
+  blockedOnThreadWait?: boolean;
+  pendingRuntimeRequest?: {
+    id: string;
+    kind: string;
+    createdAt: string;
+    blocking?: boolean;
+  } | null;
+  pendingGuestMessageCount?: number;
+  pendingBackgroundTasks?: { kind: string; awaited?: boolean }[];
+  hasActionableProposedPlan?: boolean;
+  settledOverride?: "settled" | "active" | null;
+  snoozedAt?: string | null;
+  pinnedAt?: string | null;
+  lastVisitedAt?: string | null;
+  lineage?: { relationshipToParent?: string | null };
 };
 
 export type ShellSnapshot = {
@@ -87,6 +109,8 @@ type EnvironmentDescriptor = {
   serverVersion?: string;
   /** Absent on servers that predate protocol v2. */
   orchestrationProtocolVersion?: number;
+  /** What this server can do, e.g. threadSnooze, threadPinning, threadStop. */
+  capabilities?: Record<string, unknown>;
 };
 
 /** The server is unreachable, the token is rejected, or the request failed. Commands
@@ -109,6 +133,14 @@ export const WORKTREES_DIR = join(homedir(), ".t3", "worktrees");
 export const preferences = () => getPreferenceValues<Preferences>();
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function isLoopback(origin: string): boolean {
+  try {
+    return LOOPBACK_HOSTS.has(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
 
 /** The token is a long-lived credential for the local T3 server, so it only ever
  * travels to loopback or over TLS. A plain-http remote origin is refused rather
@@ -277,22 +309,37 @@ export const dispatch = (command: Record<string, unknown>) =>
     body: JSON.stringify(command),
   });
 
-/** Threads the sidebar shows as active: nothing deleted, archived, settled or snoozed. */
-export function activeThreads(snapshot: ShellSnapshot): Thread[] {
-  return snapshot.threads.filter(
-    (thread) =>
-      !thread.deletedAt &&
-      !thread.archivedAt &&
-      !thread.settledAt &&
-      !thread.snoozedUntil,
-  );
+/** What the thread actions need to know about the server: which of them it supports,
+ * and the link to each thread. */
+export type ServerInfo = {
+  protocolVersion: number;
+  environmentId: string | undefined;
+  capabilities: Record<string, unknown>;
+};
+
+export async function getServerInfo(): Promise<ServerInfo> {
+  const descriptor = await serverDescriptor(await resolveOrigin());
+  return {
+    protocolVersion: descriptor.orchestrationProtocolVersion ?? 1,
+    environmentId: descriptor.environmentId,
+    capabilities: descriptor.capabilities ?? {},
+  };
 }
 
-/** Active threads whose agent has stopped, so the next move is yours. */
-export function waitingThreads(snapshot: ShellSnapshot): Thread[] {
-  return activeThreads(snapshot).filter(
-    (thread) => thread.latestTurn?.state !== "running",
-  );
+/** Sends one orchestration command over the WebSocket, the only way protocol v2 takes
+ * them. The command id is filled in here. */
+export async function dispatchCommand(
+  command: { type: string; threadId: string } & Record<string, unknown>,
+): Promise<void> {
+  const rpc = await openServerRpc();
+  try {
+    await rpc.call("orchestration.dispatchCommand", {
+      commandId: randomUUID(),
+      ...command,
+    });
+  } finally {
+    rpc.close();
+  }
 }
 
 export function liveThreads(snapshot: ShellSnapshot): Thread[] {
@@ -403,6 +450,7 @@ type ProviderInstance = {
 type T3Settings = {
   providerInstances?: Record<string, ProviderInstance | undefined>;
   favorites?: { provider: string; model: string }[];
+  snoozePresets?: SnoozePresetSetting[];
 };
 
 const DRIVER_NAMES: Record<string, string> = {
@@ -443,6 +491,19 @@ export async function providerNames(): Promise<Record<string, string>> {
 export async function t3Favorites(): Promise<string[]> {
   const { favorites = [] } = await readSettings();
   return favorites.map((favorite) => `${favorite.provider}|${favorite.model}`);
+}
+
+/** The snooze presets set in T3, so the menu offers the same times as the app's. A
+ * remote server's settings are not on this machine, so it gets T3's defaults. */
+export async function snoozePresets(): Promise<SnoozePresetSetting[]> {
+  const configured = preferences().origin?.trim();
+  if (configured && !isLoopback(configured)) {
+    return DEFAULT_SNOOZE_PRESETS;
+  }
+  const { snoozePresets: presets } = await readSettings();
+  return Array.isArray(presets) && presets.length > 0
+    ? presets
+    : DEFAULT_SNOOZE_PRESETS;
 }
 
 export const isFavoriteModel = (key: string, favorites: string[]) =>

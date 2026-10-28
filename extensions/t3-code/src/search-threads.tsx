@@ -1,11 +1,11 @@
 import ThreadList from "./thread-list";
-import { liveThreads } from "./t3";
+import { listedThreads } from "./thread-state";
 
 export default function Command() {
   return (
     <ThreadList
-      select={(_threads, snapshot) => liveThreads(snapshot)}
-      searchBarPlaceholder="Search threads by title, project or branch"
+      select={listedThreads}
+      searchBarPlaceholder="Search threads by title, project, branch or status"
       emptyTitle="No threads"
       emptyDescription="This T3 Code environment has no live threads."
     />

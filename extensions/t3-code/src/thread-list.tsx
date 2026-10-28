@@ -4,59 +4,41 @@ import {
   Color,
   Icon,
   List,
-  closeMainWindow,
-  showHUD,
   showToast,
   Toast,
 } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
+import { useState } from "react";
 import {
-  errorMessage,
-  focusThread,
+  getServerInfo,
   getShell,
   launchApp,
   liveProjects,
+  ShellSnapshot,
+  snoozePresets,
   T3Error,
   Thread,
   threadTimestamp,
 } from "./t3";
+import { ThreadActions } from "./thread-actions";
+import {
+  Section,
+  SECTIONS,
+  sectionOf,
+  statusColor,
+  statusOf,
+  threadIcon,
+} from "./thread-state";
 
 type Props = {
   /** Which threads the command shows, applied to the shell snapshot. */
-  select: (
-    threads: Thread[],
-    snapshot: Awaited<ReturnType<typeof getShell>>,
-  ) => Thread[];
+  select: (snapshot: ShellSnapshot) => Thread[];
   searchBarPlaceholder: string;
   emptyTitle: string;
   emptyDescription: string;
 };
 
-function statusAccessory(thread: Thread): List.Item.Accessory {
-  const state = thread.latestTurn?.state;
-  if (state === "running") {
-    return {
-      icon: { source: Icon.CircleProgress, tintColor: Color.Blue },
-      tooltip: "Agent is running",
-    };
-  }
-  if (state === "error" || thread.session?.lastError) {
-    return {
-      icon: { source: Icon.ExclamationMark, tintColor: Color.Red },
-      tooltip: "Last turn failed",
-    };
-  }
-  if (state === "interrupted") {
-    return {
-      icon: { source: Icon.Pause, tintColor: Color.Orange },
-      tooltip: "Interrupted",
-    };
-  }
-  return {
-    icon: { source: Icon.CheckCircle, tintColor: Color.Green },
-    tooltip: "Waiting on you",
-  };
-}
+const ALL = "all";
 
 export default function ThreadList({
   select,
@@ -64,26 +46,79 @@ export default function ThreadList({
   emptyTitle,
   emptyDescription,
 }: Props) {
-  const { data, isLoading, error, revalidate } = usePromise(async () => ({
-    snapshot: await getShell(),
-  }));
+  const [filter, setFilter] = useState(ALL);
+  const { data, isLoading, error, revalidate } = usePromise(async () => {
+    const [snapshot, server, presets] = await Promise.all([
+      getShell(),
+      // The list still works against a server that cannot describe itself; it just
+      // offers no actions beyond opening and copying.
+      getServerInfo().catch(() => undefined),
+      snoozePresets(),
+    ]);
+    return { snapshot, server, presets };
+  });
 
   if (error) {
     return <ErrorView error={error} onRetry={revalidate} />;
   }
 
   const snapshot = data?.snapshot;
-  const projectTitles = new Map(
-    (snapshot ? liveProjects(snapshot) : []).map((p) => [p.id, p.title]),
-  );
-  const threads = snapshot
-    ? select(snapshot.threads, snapshot).sort(
-        (a, b) => threadTimestamp(b) - threadTimestamp(a),
-      )
-    : [];
+  const projects = snapshot ? liveProjects(snapshot) : [];
+  const projectTitles = new Map(projects.map((p) => [p.id, p.title]));
+  const now = Date.now();
+  const rows = (snapshot ? select(snapshot) : [])
+    .map((thread) => ({
+      thread,
+      section: sectionOf(thread, now),
+      status: statusOf(thread),
+    }))
+    .filter(
+      ({ thread, section }) =>
+        filter === ALL ||
+        filter === `section:${section}` ||
+        filter === `project:${thread.projectId}`,
+    )
+    .sort((a, b) => threadTimestamp(b.thread) - threadTimestamp(a.thread));
+
+  const sections = SECTIONS.map(({ id, title }) => ({
+    id,
+    title,
+    rows: rows.filter((row) => row.section === id),
+  })).filter((section) => section.rows.length > 0);
 
   return (
-    <List isLoading={isLoading} searchBarPlaceholder={searchBarPlaceholder}>
+    <List
+      isLoading={isLoading}
+      searchBarPlaceholder={searchBarPlaceholder}
+      searchBarAccessory={
+        <List.Dropdown
+          tooltip="Show"
+          storeValue
+          onChange={setFilter}
+          value={filter}
+        >
+          <List.Dropdown.Item title="All Threads" value={ALL} />
+          <List.Dropdown.Section title="Section">
+            {SECTIONS.map(({ id, title }) => (
+              <List.Dropdown.Item
+                key={id}
+                title={title}
+                value={`section:${id}`}
+              />
+            ))}
+          </List.Dropdown.Section>
+          <List.Dropdown.Section title="Project">
+            {projects.map((project) => (
+              <List.Dropdown.Item
+                key={project.id}
+                title={project.title}
+                value={`project:${project.id}`}
+              />
+            ))}
+          </List.Dropdown.Section>
+        </List.Dropdown>
+      }
+    >
       {isLoading ? null : (
         <List.EmptyView
           title={emptyTitle}
@@ -91,66 +126,71 @@ export default function ThreadList({
           icon={Icon.Message}
         />
       )}
-      {threads.map((thread) => (
-        <List.Item
-          key={thread.id}
-          title={thread.title}
-          subtitle={projectTitles.get(thread.projectId) ?? ""}
-          keywords={[
-            projectTitles.get(thread.projectId) ?? "",
-            thread.branch ?? "",
-          ]}
-          accessories={[
-            ...(thread.branch ? [{ tag: thread.branch }] : []),
-            { date: new Date(thread.updatedAt) },
-            statusAccessory(thread),
-          ]}
-          actions={
-            <ActionPanel>
-              <Action
-                title="Open in T3 Code"
-                icon={Icon.ArrowRight}
-                onAction={async () => {
-                  await closeMainWindow();
-                  try {
-                    const outcome = await focusThread({
-                      id: thread.id,
-                      title: thread.title,
-                      projectTitle: projectTitles.get(thread.projectId),
-                      branch: thread.branch,
-                    });
-                    if (outcome === "ambiguous") {
-                      await showHUD(
-                        "Several threads match - pick one in the T3 Code palette",
-                      );
-                    } else if (outcome === "unfocused") {
-                      await showHUD(
-                        "T3 Code lost focus - pick the thread in its palette",
-                      );
-                    }
-                  } catch (focusError) {
-                    // The Raycast window is already closed, so a toast would go
-                    // unseen.
-                    await showHUD(
-                      `Could not open T3 Code: ${errorMessage(focusError)}`,
-                    );
-                  }
-                }}
-              />
-              <Action.CopyToClipboard
-                title="Copy Thread ID"
-                content={thread.id}
-              />
-              <Action
-                title="Refresh"
-                icon={Icon.ArrowClockwise}
-                onAction={revalidate}
-              />
-            </ActionPanel>
-          }
-        />
+      {sections.map((section) => (
+        <List.Section
+          key={section.id}
+          title={section.title}
+          subtitle={String(section.rows.length)}
+        >
+          {section.rows.map(({ thread, section: id, status }) => (
+            <ThreadItem
+              key={thread.id}
+              thread={thread}
+              section={id}
+              status={status}
+              projectTitle={projectTitles.get(thread.projectId)}
+              actions={
+                <ThreadActions
+                  thread={thread}
+                  projectTitle={projectTitles.get(thread.projectId)}
+                  section={id}
+                  status={status}
+                  server={data?.server}
+                  snoozePresets={data?.presets ?? []}
+                  onChange={revalidate}
+                />
+              }
+            />
+          ))}
+        </List.Section>
       ))}
     </List>
+  );
+}
+
+function ThreadItem(props: {
+  thread: Thread;
+  section: Section;
+  status: ReturnType<typeof statusOf>;
+  projectTitle: string | undefined;
+  actions: List.Item.Props["actions"];
+}) {
+  const { thread, section, status, projectTitle } = props;
+  const snoozedUntil =
+    section === "snoozed" && thread.snoozedUntil
+      ? new Date(thread.snoozedUntil)
+      : undefined;
+  return (
+    <List.Item
+      title={thread.title}
+      subtitle={projectTitle ?? ""}
+      icon={threadIcon(status, section)}
+      keywords={[projectTitle ?? "", thread.branch ?? "", status ?? ""]}
+      accessories={[
+        ...(status
+          ? [{ tag: { value: status, color: statusColor(status) } }]
+          : []),
+        ...(thread.branch ? [{ tag: thread.branch }] : []),
+        snoozedUntil
+          ? {
+              icon: Icon.Clock,
+              date: snoozedUntil,
+              tooltip: `Snoozed until ${snoozedUntil.toLocaleString()}`,
+            }
+          : { date: new Date(thread.updatedAt) },
+      ]}
+      actions={props.actions}
+    />
   );
 }
 
