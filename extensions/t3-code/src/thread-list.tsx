@@ -10,11 +10,14 @@ import {
 import { usePromise } from "@raycast/utils";
 import { useState } from "react";
 import {
-  getServerInfo,
-  getShell,
+  Environment,
+  EnvironmentFailure,
+  errorMessage,
+  failureSummary,
   launchApp,
   liveProjects,
-  loadEnvironments,
+  loadShells,
+  PRIMARY_ENVIRONMENT,
   ShellSnapshot,
   snoozePresets,
   T3Error,
@@ -41,6 +44,25 @@ type Props = {
 
 const ALL = "all";
 
+/** When every environment failed there is nothing to list. With one environment its
+ * own error is shown as before; with several, each one's reason, and the primary's
+ * kind decides whether launching T3 Code is offered. */
+export function allFailedError(failures: EnvironmentFailure[]): Error {
+  if (failures.length === 1) {
+    return failures[0].error;
+  }
+  const primary =
+    failures.find(
+      (failure) => failure.environment.key === PRIMARY_ENVIRONMENT,
+    ) ?? failures[0];
+  const message = failures
+    .map((failure) => `${failure.label}: ${failure.error.message}`)
+    .join("\n");
+  return primary.error instanceof T3Error
+    ? new T3Error(primary.error.kind, message)
+    : new Error(message);
+}
+
 export default function ThreadList({
   select,
   searchBarPlaceholder,
@@ -49,37 +71,60 @@ export default function ThreadList({
 }: Props) {
   const [filter, setFilter] = useState(ALL);
   const { data, isLoading, error, revalidate } = usePromise(async () => {
-    const [environment] = await loadEnvironments();
-    const [snapshot, server, presets] = await Promise.all([
-      getShell(environment),
-      // The list still works against a server that cannot describe itself; it just
-      // offers no actions beyond opening and copying.
-      getServerInfo(environment).catch(() => undefined),
-      snoozePresets(environment),
-    ]);
-    return { environment, snapshot, server, presets };
+    const { environments, shells, failures } = await loadShells();
+    if (shells.length === 0) {
+      throw allFailedError(failures);
+    }
+    const presets = await Promise.all(
+      shells.map((shell) => snoozePresets(shell.environment)),
+    );
+    return {
+      multiple: environments.length > 1,
+      shells: shells.map((shell, index) => ({
+        ...shell,
+        presets: presets[index],
+      })),
+      failures,
+    };
   });
 
   if (error) {
     return <ErrorView error={error} onRetry={revalidate} />;
   }
 
-  const snapshot = data?.snapshot;
-  const environment = data?.environment;
-  const projects = snapshot ? liveProjects(snapshot) : [];
-  const projectTitles = new Map(projects.map((p) => [p.id, p.title]));
+  const multiple = data?.multiple ?? false;
+  const shells = data?.shells ?? [];
   const now = Date.now();
-  const rows = (snapshot ? select(snapshot) : [])
-    .map((thread) => ({
-      thread,
-      section: sectionOf(thread, now),
-      status: statusOf(thread),
-    }))
+  // Thread and project ids are only unique within one environment.
+  const projectKey = (environment: Environment, projectId: string) =>
+    `${environment.key}:${projectId}`;
+  const projectsByEnvironment = shells.map((shell) => ({
+    shell,
+    projects: liveProjects(shell.snapshot),
+  }));
+  const projectTitles = new Map(
+    projectsByEnvironment.flatMap(({ shell, projects }) =>
+      projects.map((project) => [
+        projectKey(shell.environment, project.id),
+        project.title,
+      ]),
+    ),
+  );
+  const rows = shells
+    .flatMap((shell) =>
+      select(shell.snapshot).map((thread) => ({
+        shell,
+        thread,
+        section: sectionOf(thread, now),
+        status: statusOf(thread),
+      })),
+    )
     .filter(
-      ({ thread, section }) =>
+      ({ shell, thread, section }) =>
         filter === ALL ||
         filter === `section:${section}` ||
-        filter === `project:${thread.projectId}`,
+        filter === `environment:${shell.environment.key}` ||
+        filter === `project:${projectKey(shell.environment, thread.projectId)}`,
     )
     .sort((a, b) => threadTimestamp(b.thread) - threadTimestamp(a.thread));
 
@@ -88,6 +133,14 @@ export default function ThreadList({
     title,
     rows: rows.filter((row) => row.section === id),
   })).filter((section) => section.rows.length > 0);
+
+  // A failed environment stays visible whatever the filter, unless the filter is
+  // another environment, so a short list never hides that something is missing.
+  const failures = (data?.failures ?? []).filter(
+    (failure) =>
+      !filter.startsWith("environment:") ||
+      filter === `environment:${failure.environment.key}`,
+  );
 
   return (
     <List
@@ -101,6 +154,19 @@ export default function ThreadList({
           value={filter}
         >
           <List.Dropdown.Item title="All Threads" value={ALL} />
+          {multiple ? (
+            <List.Dropdown.Section title="Environment">
+              {[...shells, ...(data?.failures ?? [])].map(
+                ({ environment, label }) => (
+                  <List.Dropdown.Item
+                    key={environment.key}
+                    title={label}
+                    value={`environment:${environment.key}`}
+                  />
+                ),
+              )}
+            </List.Dropdown.Section>
+          ) : null}
           <List.Dropdown.Section title="Section">
             {SECTIONS.map(({ id, title }) => (
               <List.Dropdown.Item
@@ -110,57 +176,127 @@ export default function ThreadList({
               />
             ))}
           </List.Dropdown.Section>
-          <List.Dropdown.Section title="Project">
-            {projects.map((project) => (
-              <List.Dropdown.Item
-                key={project.id}
-                title={project.title}
-                value={`project:${project.id}`}
-              />
-            ))}
-          </List.Dropdown.Section>
+          {projectsByEnvironment.map(({ shell, projects }) => (
+            <List.Dropdown.Section
+              key={shell.environment.key}
+              title={multiple ? `Projects on ${shell.label}` : "Project"}
+            >
+              {projects.map((project) => (
+                <List.Dropdown.Item
+                  key={project.id}
+                  title={project.title}
+                  value={`project:${projectKey(shell.environment, project.id)}`}
+                />
+              ))}
+            </List.Dropdown.Section>
+          ))}
         </List.Dropdown>
       }
     >
-      {isLoading ? null : (
+      {isLoading || failures.length > 0 ? null : (
         <List.EmptyView
           title={emptyTitle}
           description={emptyDescription}
           icon={Icon.Message}
         />
       )}
+      {failures.length > 0 ? (
+        <List.Section title="Unavailable">
+          {failures.map((failure) => (
+            <FailureItem
+              key={failure.environment.key}
+              failure={failure}
+              onRetry={revalidate}
+            />
+          ))}
+        </List.Section>
+      ) : null}
       {sections.map((section) => (
         <List.Section
           key={section.id}
           title={section.title}
           subtitle={String(section.rows.length)}
         >
-          {section.rows.map(({ thread, section: id, status }) =>
-            environment ? (
+          {section.rows.map(({ shell, thread, section: id, status }) => {
+            const projectTitle = projectTitles.get(
+              projectKey(shell.environment, thread.projectId),
+            );
+            return (
               <ThreadItem
-                key={thread.id}
+                key={`${shell.environment.key}:${thread.id}`}
                 thread={thread}
                 section={id}
                 status={status}
-                projectTitle={projectTitles.get(thread.projectId)}
+                projectTitle={projectTitle}
+                environmentLabel={multiple ? shell.label : undefined}
                 actions={
                   <ThreadActions
-                    environment={environment}
+                    environment={shell.environment}
                     thread={thread}
-                    projectTitle={projectTitles.get(thread.projectId)}
+                    projectTitle={projectTitle}
                     section={id}
                     status={status}
-                    server={data?.server}
-                    snoozePresets={data?.presets ?? []}
+                    server={shell.server}
+                    snoozePresets={shell.presets}
                     onChange={revalidate}
                   />
                 }
               />
-            ) : null,
-          )}
+            );
+          })}
         </List.Section>
       ))}
     </List>
+  );
+}
+
+/** One environment that could not be read, with the reason, in place of its threads. */
+function FailureItem(props: {
+  failure: EnvironmentFailure;
+  onRetry: () => void;
+}) {
+  const { environment, label, error } = props.failure;
+  const unreachable = error instanceof T3Error && error.kind === "unreachable";
+  return (
+    <List.Item
+      title={label}
+      subtitle={errorMessage(error)}
+      icon={{ source: Icon.Plug, tintColor: Color.Red }}
+      keywords={[label]}
+      accessories={[
+        {
+          tag: { value: failureSummary(error), color: Color.Red },
+          tooltip: environment.origin,
+        },
+      ]}
+      actions={
+        <ActionPanel>
+          <Action
+            title="Retry"
+            icon={Icon.ArrowClockwise}
+            onAction={props.onRetry}
+          />
+          {/* Only the primary environment is the T3 Code app on this machine. */}
+          {unreachable && environment.key === PRIMARY_ENVIRONMENT ? (
+            <Action
+              title="Launch T3 Code"
+              icon={Icon.AppWindow}
+              onAction={async () => {
+                await launchApp();
+                await showToast({
+                  style: Toast.Style.Success,
+                  title: "Launching T3 Code",
+                });
+              }}
+            />
+          ) : null}
+          <Action.CopyToClipboard
+            title="Copy Error"
+            content={`${label} (${environment.origin}): ${errorMessage(error)}`}
+          />
+        </ActionPanel>
+      }
+    />
   );
 }
 
@@ -169,9 +305,11 @@ function ThreadItem(props: {
   section: Section;
   status: ReturnType<typeof statusOf>;
   projectTitle: string | undefined;
+  /** Set only when more than one environment is configured. */
+  environmentLabel: string | undefined;
   actions: List.Item.Props["actions"];
 }) {
-  const { thread, section, status, projectTitle } = props;
+  const { thread, section, status, projectTitle, environmentLabel } = props;
   const snoozedUntil =
     section === "snoozed" && thread.snoozedUntil
       ? new Date(thread.snoozedUntil)
@@ -181,12 +319,25 @@ function ThreadItem(props: {
       title={thread.title}
       subtitle={projectTitle ?? ""}
       icon={threadIcon(status, section)}
-      keywords={[projectTitle ?? "", thread.branch ?? "", status ?? ""]}
+      keywords={[
+        projectTitle ?? "",
+        thread.branch ?? "",
+        status ?? "",
+        environmentLabel ?? "",
+      ]}
       accessories={[
         ...(status
           ? [{ tag: { value: status, color: statusColor(status) } }]
           : []),
         ...(thread.branch ? [{ tag: thread.branch }] : []),
+        ...(environmentLabel
+          ? [
+              {
+                tag: { value: environmentLabel, color: Color.SecondaryText },
+                tooltip: "Environment",
+              },
+            ]
+          : []),
         snoozedUntil
           ? {
               icon: Icon.Clock,

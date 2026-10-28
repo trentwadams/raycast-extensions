@@ -129,6 +129,24 @@ export class T3Error extends Error {
 export const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
+/** A couple of words on why an environment could not be read, short enough for a
+ * tag or the status subtitle. */
+export function failureSummary(error: unknown): string {
+  if (!(error instanceof T3Error)) {
+    return "failed";
+  }
+  switch (error.kind) {
+    case "unreachable":
+      return "offline";
+    case "unauthorized":
+      return "token rejected";
+    case "insecure-origin":
+      return "needs https";
+    default:
+      return "failed";
+  }
+}
+
 export const RUNTIME_DIR = join(homedir(), ".t3", "userdata");
 export const WORKTREES_DIR = join(homedir(), ".t3", "worktrees");
 
