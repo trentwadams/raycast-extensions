@@ -42,6 +42,7 @@ import {
   getShell,
   hasOriginRemote,
   AttachmentFile,
+  isWindows,
   IMAGE_MIME_TYPES,
   inheritedSettings,
   isFavoriteModel,
@@ -77,6 +78,30 @@ function AttachmentPreview({ files }: { files: string[] }) {
 }
 
 type PromptValues = { prompt: string; branch?: string };
+
+/** The selection these commands read lives in Finder on macOS and File Explorer on Windows. */
+const FILE_MANAGER = isWindows ? "File Explorer" : "Finder";
+
+const SEND_IN_BACKGROUND: Keyboard.Shortcut = {
+  macOS: { modifiers: ["cmd", "shift"], key: "return" },
+  Windows: { modifiers: ["ctrl", "shift"], key: "return" },
+};
+const PASTE_IMAGE: Keyboard.Shortcut = {
+  macOS: { modifiers: ["cmd", "shift"], key: "v" },
+  Windows: { modifiers: ["ctrl", "shift"], key: "v" },
+};
+const ATTACH_SELECTION: Keyboard.Shortcut = {
+  macOS: { modifiers: ["cmd", "shift"], key: "a" },
+  Windows: { modifiers: ["ctrl", "shift"], key: "a" },
+};
+const KEYS = isWindows
+  ? {
+      paste: "Ctrl+Shift+V",
+      attach: "Ctrl+Shift+A",
+      preview: "Ctrl+Y",
+      star: "Ctrl+Shift+S",
+    }
+  : { paste: "⌘⇧V", attach: "⌘⇧A", preview: "⌘Y", star: "⌘D" };
 
 const LAST_PROJECT_KEY = "last-project-id";
 const LAST_CLIPBOARD_KEY = "last-sent-clipboard-hash";
@@ -295,7 +320,7 @@ export default function Command() {
         }
       }
       if (paths.length === 0) {
-        throw new Error("No files are selected in Finder.");
+        throw new Error(`No files are selected in ${FILE_MANAGER}.`);
       }
       setFiles((current) => [
         ...current,
@@ -304,7 +329,7 @@ export default function Command() {
     } catch (finderError) {
       await showToast({
         style: Toast.Style.Failure,
-        title: "Could not read the Finder selection",
+        title: `Could not read the ${FILE_MANAGER} selection`,
         message:
           finderError instanceof Error
             ? finderError.message
@@ -392,7 +417,7 @@ export default function Command() {
     if (envMode === "worktree" && !existsSync(project.workspaceRoot)) {
       await showToast({
         style: Toast.Style.Failure,
-        title: "Worktrees need the project on this Mac",
+        title: "Worktrees need the project on this computer",
         message: `${project.workspaceRoot} does not exist here. Choose Local, or start the session from T3 Code.`,
       });
       return;
@@ -575,7 +600,7 @@ export default function Command() {
           <Action.SubmitForm
             title="Send Without Opening T3 Code"
             icon={Icon.Upload}
-            shortcut={{ modifiers: ["cmd", "shift"], key: "return" }}
+            shortcut={SEND_IN_BACKGROUND}
             onSubmit={(values: PromptValues) =>
               submit(values, { focus: false })
             }
@@ -583,13 +608,13 @@ export default function Command() {
           <Action
             title="Paste Clipboard Image"
             icon={Icon.Clipboard}
-            shortcut={{ modifiers: ["cmd", "shift"], key: "v" }}
+            shortcut={PASTE_IMAGE}
             onAction={pasteClipboardImage}
           />
           <Action
-            title="Attach Finder Selection"
+            title={`Attach ${FILE_MANAGER} Selection`}
             icon={Icon.Finder}
-            shortcut={{ modifiers: ["cmd", "shift"], key: "a" }}
+            shortcut={ATTACH_SELECTION}
             onAction={attachFinderSelection}
           />
           {files.length > 0 ? (
@@ -634,14 +659,14 @@ export default function Command() {
         onChange={setFiles}
         allowMultipleSelection
         canChooseDirectories={false}
-        info="Any file, up to 8: images to 10 MB, others to 50 MB. A screenshot on the clipboard is attached when this opens. ⌘⇧V attaches one copied later, ⌘⇧A the Finder selection, ⌘Y previews."
+        info={`Any file, up to 8: images to 10 MB, others to 50 MB. A screenshot on the clipboard is attached when this opens. ${KEYS.paste} attaches one copied later, ${KEYS.attach} the ${FILE_MANAGER} selection, ${KEYS.preview} previews.`}
       />
       <Form.Dropdown
         id="preset"
         title="Preset"
         value={presetValue}
         onChange={choosePreset}
-        info="Project · model · permissions (Full, Auto, Edits = auto-accept edits, Approval) · Worktree when it makes a new one. ⌘D stars the current settings so they stay at the top."
+        info={`Project · model · permissions (Full, Auto, Edits = auto-accept edits, Approval) · Worktree when it makes a new one. ${KEYS.star} stars the current settings so they stay at the top.`}
       >
         {savedList.length > 0 ? (
           <Form.Dropdown.Section title="Starred">

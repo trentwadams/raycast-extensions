@@ -1,7 +1,7 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { access, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { extname, basename, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { getPreferenceValues, open } from "@raycast/api";
@@ -605,17 +605,35 @@ const NIGHTLY_APP = "T3 Code (Nightly)";
 // Same pattern T3 uses to brand a build as Nightly. Preview builds share the branding.
 const NIGHTLY_VERSION = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/;
 
-async function isInstalled(name: string): Promise<boolean> {
-  for (const dir of ["/Applications", join(homedir(), "Applications")]) {
+export const isWindows = process.platform === "win32";
+
+/** Where the installer puts the app: an .app bundle on macOS, a per-user .exe named
+ * after the release channel on Windows. */
+function installCandidates(name: string): string[] {
+  if (isWindows) {
+    const localAppData =
+      process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+    return [join(localAppData, "Programs", "t3code", `${name}.exe`)];
+  }
+  return ["/Applications", join(homedir(), "Applications")].map((dir) =>
+    join(dir, `${name}.app`),
+  );
+}
+
+async function installedPath(name: string): Promise<string | undefined> {
+  for (const candidate of installCandidates(name)) {
     try {
-      await access(join(dir, `${name}.app`));
-      return true;
+      await access(candidate);
+      return candidate;
     } catch {
-      // not in this folder
+      // not installed here
     }
   }
-  return false;
+  return undefined;
 }
+
+const isInstalled = async (name: string) =>
+  (await installedPath(name)) !== undefined;
 
 /** The app bundle is named after its release channel, so a fixed name only fits one
  * of them. The preference wins; otherwise follow the running server's version, and
@@ -752,12 +770,33 @@ export async function focusThread(
 ): Promise<"opened" | "ambiguous" | "unfocused"> {
   const link = await threadLinkFor(target.id);
   if (link) {
-    // Naming the app keeps the link in the channel this server belongs to when
-    // both the stable and Nightly builds are installed.
-    await open(link, await appName());
+    await openAppLink(link);
     return "opened";
   }
+  if (isWindows) {
+    // The palette fallback drives macOS keystrokes; an app that old can only be shown.
+    await launchApp();
+    return "unfocused";
+  }
   return focusThreadInPalette(target);
+}
+
+/** Both release channels register the same t3code:// scheme, so whichever installed
+ * last would get the link. Handing it to this server's own app keeps it in the right
+ * channel: on macOS by name, on Windows by starting the .exe with the link, which is
+ * what the scheme's registered command does and reaches a running instance too. */
+async function openAppLink(link: string): Promise<void> {
+  const name = await appName();
+  if (isWindows) {
+    const exe = await installedPath(name);
+    if (exe) {
+      spawn(exe, [link], { detached: true, stdio: "ignore" }).unref();
+      return;
+    }
+    await open(link);
+    return;
+  }
+  await open(link, name);
 }
 
 /** For desktop builds that only reveal their window for an external URL: focus the
@@ -808,12 +847,25 @@ return "unfocused"`,
   return stdout.trim() === "opened" ? "opened" : "unfocused";
 }
 
+/** Starts T3 Code, or brings a running instance forward: its single-instance lock hands
+ * a second launch to the first. */
 export async function launchApp(): Promise<void> {
-  await run("/usr/bin/open", ["-a", await appName()]);
+  const name = await appName();
+  if (!isWindows) {
+    await run("/usr/bin/open", ["-a", name]);
+    return;
+  }
+  const exe = await installedPath(name);
+  if (!exe) {
+    throw new Error(
+      `${name} is not installed in ${dirname(installCandidates(name)[0])}. Set the App Name preference to the installed build.`,
+    );
+  }
+  spawn(exe, [], { detached: true, stdio: "ignore" }).unref();
 }
 
 export function worktreePathFor(workspaceRoot: string, branch: string): string {
-  const repoName = workspaceRoot.split("/").filter(Boolean).pop() ?? "repo";
+  const repoName = workspaceRoot.split(/[\\/]/).filter(Boolean).pop() ?? "repo";
   return join(WORKTREES_DIR, repoName, branch.replace(/\//g, "-"));
 }
 
@@ -993,6 +1045,29 @@ export const IMAGE_MIME_TYPES: Record<string, string> = {
   ".webp": "image/webp",
   ".gif": "image/gif",
 };
+/** The types an agent most often gets handed, for platforms without `file`. */
+const FILE_MIME_TYPES: Record<string, string> = {
+  ".txt": "text/plain",
+  ".log": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".html": "text/html",
+  ".css": "text/css",
+  ".js": "text/javascript",
+  ".ts": "text/plain",
+  ".tsx": "text/plain",
+  ".py": "text/x-python",
+  ".json": "application/json",
+  ".xml": "application/xml",
+  ".yaml": "application/yaml",
+  ".yml": "application/yaml",
+  ".pdf": "application/pdf",
+  ".zip": "application/zip",
+  ".svg": "image/svg+xml",
+  ".docx":
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 const UPLOAD_TIMEOUT_MS = 5 * 60_000;
 const LAUNCH_TIMEOUT_MS = 5 * 60_000;
 export const MAX_ATTACHMENTS = 8;
@@ -1012,9 +1087,14 @@ export type AttachmentFile = {
 /** The extension decides images, since T3 accepts only four types as images; anything
  * else goes to `file` for its mime type, which the server stores and hands to the agent. */
 async function mimeTypeOf(path: string): Promise<string> {
-  const known = IMAGE_MIME_TYPES[extname(path).toLowerCase()];
+  const extension = extname(path).toLowerCase();
+  const known = IMAGE_MIME_TYPES[extension];
   if (known) {
     return known;
+  }
+  // Windows has no `file` command, so it goes by extension alone.
+  if (isWindows) {
+    return FILE_MIME_TYPES[extension] ?? "application/octet-stream";
   }
   try {
     const { stdout } = await run("file", ["--brief", "--mime-type", path]);

@@ -1,6 +1,6 @@
 # T3 Code for Raycast
 
-Three commands against the T3 Code server running on this Mac.
+Three commands against the T3 Code server running on this computer, on macOS or Windows.
 
 - **Prompt T3 Code** — write a prompt, attach files, pick a preset (project, model, permissions and workspace), optionally branch into a git worktree. Creates the thread, sends the prompt, opens the thread in T3 Code.
 - **Waiting T3 Threads** — active threads (not settled, snoozed or archived) whose agent has stopped.
@@ -10,19 +10,22 @@ Three commands against the T3 Code server running on this Mac.
 
 - **Files** take any file type, up to 8 per prompt: images up to 10 MB, other files up to 50 MB.
   A screenshot on the clipboard is attached when the command opens, unless it was already sent.
-  `⌘⇧V` attaches one copied later, `⌘⇧A` attaches the files selected in Finder, and `⌘Y` previews
-  what is attached. Protocol v1 servers accept images only.
+  `⌘⇧V` (`Ctrl+Shift+V` on Windows) attaches one copied later, `⌘⇧A` (`Ctrl+Shift+A`) attaches the
+  files selected in Finder or File Explorer, and `⌘Y` (`Ctrl+Y`) previews what is attached. Protocol v1 servers accept images only.
 - **Preset** is the project, model, permissions and workspace in one choice. Starred presets come
   first, then the combinations you used recently. `⌘D` stars the current settings, and again
   unstars them. Choose Custom… for the separate fields. Model names show the provider and effort,
   for example `Claude · Sonnet 5.5 · high · 1M`.
-- `↵` sends and opens the thread in T3 Code. `⌘⇧↵` sends and leaves T3 Code alone.
-- Worktrees need the project folder on this Mac, because the base branch is read from its git
+- `↵` sends and opens the thread in T3 Code. `⌘⇧↵` (`Ctrl+Shift+↵`) sends and leaves T3 Code alone.
+- Worktrees need the project folder on this computer, because the base branch is read from its git
   repository.
 
 ## Setup
 
-Issue a token and paste it into the extension preferences on first run:
+Issue a token and paste it into the extension preferences on first run. The two scopes
+are all the extension uses: reading threads, and creating and acting on them.
+
+On macOS:
 
 ```
 # Server address: the running server publishes it here.
@@ -33,12 +36,18 @@ ORIGIN=$(node -p "JSON.parse(require('fs').readFileSync(process.env.HOME+'/.t3/u
 
 # Issue the token with the CLI at the server's own version.
 VERSION=$(curl -s $ORIGIN/.well-known/t3/environment | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).serverVersion")
-npx t3@$VERSION auth session issue --ttl 365d --label raycast --token-only
+npx t3@$VERSION auth session issue --ttl 365d --label raycast --scope orchestration:read --scope orchestration:operate --token-only
+```
+
+On Windows, in PowerShell. The desktop app installs its own CLI, already at the app's version:
+
+```
+& "$env:USERPROFILE\.t3\bin\t3.cmd" auth session issue --ttl 365d --label raycast --scope orchestration:read --scope orchestration:operate --token-only
 ```
 
 The CLI must match the server's version: a token issued by a different version can be
-written to the previous database, and the server then rejects it. The commands use only
-`node`, `curl` and `npx`, which come with macOS and Node.
+written to the previous database, and the server then rejects it. The macOS commands use
+only `node`, `curl` and `npx`, which come with macOS and Node.
 
 Revoke it with `t3 auth session revoke`, list sessions with `t3 auth session list`.
 
@@ -88,4 +97,12 @@ list of its own. Provider names, custom models and starred models are read from
 ```
 npm install
 npm run dev
+```
+
+The extension stays on `@raycast/api` 1.104 so it installs on older Raycast versions. On
+Windows, Raycast 2 loads development builds from a folder only the 2.x CLI writes to, so
+develop with that CLI instead of `npm run dev`:
+
+```
+npx -p @raycast/api@latest ray develop
 ```
