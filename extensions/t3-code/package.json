@@ -2,9 +2,12 @@
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "t3-code",
   "title": "T3 Code",
-  "description": "Start T3 Code sessions, search threads, and jump to the ones waiting on you.",
+  "description": "Start T3 Code sessions, see and act on your threads, and keep an eye on the ones waiting on you.",
   "icon": "icon.png",
   "author": "skilux",
+  "contributors": [
+    "trentwadams"
+  ],
   "categories": [
     "Developer Tools"
   ],

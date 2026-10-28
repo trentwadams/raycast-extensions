@@ -1,5 +1,15 @@
 # T3 Code Changelog
 
+## [Windows, thread actions and a status command] - {PR_MERGE_DATE}
+
+- Windows support for every command. T3 Code is launched from its install folder, clipboard screenshots attach, and shortcuts use Ctrl.
+- Threads open through their `t3code://` deep link, straight to the thread, without typing into T3's command palette or needing Accessibility permission. Servers older than 0.1.0 keep the palette.
+- Search T3 Threads and Waiting T3 Threads group threads into T3's sidebar sections (Pinned, Working, Active, Snoozed, Settled) with T3's status for each, and a dropdown filters by section or project. Subagent threads stay under their parent.
+- New thread actions: Reply, Approve and Decline a pending request, Stop, Settle, Snooze with your T3 presets, Pin, Mark as Read or Unread, Rename, Archive and Delete, plus Copy Thread Link.
+- New T3 Code Status command: a root search subtitle such as `🟠 2 need you · 🟢 1 done · 🔵 3 working`, refreshed every minute in the background.
+- The stable build's new name, T3 Code (Beta), is recognised.
+- The setup instructions issue a token with only the scopes the extension uses.
+
 ## [Prompt T3 Code on protocol v2, files, presets and providers] - 2026-10-17
 
 - Prompt T3 Code works on protocol v2 servers. It creates the thread, the worktree and the first message over the WebSocket, and still uses HTTP on v1.

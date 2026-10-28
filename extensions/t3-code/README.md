@@ -1,10 +1,43 @@
 # T3 Code for Raycast
 
-Three commands against the T3 Code server running on this computer, on macOS or Windows.
+Four commands against the T3 Code server running on this computer, on macOS or Windows.
 
 - **Prompt T3 Code** — write a prompt, attach files, pick a preset (project, model, permissions and workspace), optionally branch into a git worktree. Creates the thread, sends the prompt, opens the thread in T3 Code.
-- **Waiting T3 Threads** — active threads (not settled, snoozed or archived) whose agent has stopped.
-- **Search T3 Threads** — every live thread, by title, project or branch.
+- **Waiting T3 Threads** — pinned and active threads whose agent has stopped, so the next move is yours.
+- **Search T3 Threads** — every thread, grouped the way T3's sidebar groups them, with the actions T3 offers.
+- **T3 Code Status** — shows in root search what needs you, what finished and what is working, refreshed every minute in the background.
+
+## Threads
+
+Both thread commands group threads into T3's sidebar sections, Pinned, Working, Active,
+Snoozed and Settled, and show T3's status for each: Pending Approval, Awaiting Input,
+Guest Request, Working, Connecting, Waiting, Failed, Plan Ready or Completed. Subagent
+threads stay under their parent, as in the sidebar. The dropdown narrows the list to one
+section or one project, and the search matches title, project, branch and status.
+
+`↵` opens the thread in T3 Code. On protocol v2 servers the action panel also acts on it:
+
+- **Reply** sends a follow-up. While the agent is working it is queued to run next, as T3's
+  composer does.
+- **Approve Request** and **Decline Request** answer a pending approval. Raycast can't show
+  what the agent wants to do, so Approve asks for confirmation first.
+- **Stop Agent**, **Settle** / **Unsettle**, **Snooze** / **Unsnooze**, **Pin** / **Unpin**,
+  **Mark as Read** / **Mark as Unread**, **Rename**, **Archive** and **Delete**.
+  Snooze offers the presets set in T3's settings. Settle, Snooze and Archive can be undone
+  from the toast.
+- **Copy Thread Link** copies the `t3code://` link that opens the thread.
+
+An action only shows when the server reports the capability it needs.
+
+## T3 Code Status
+
+A background command, since menu bar commands aren't available on Windows. Its subtitle in
+root search reads like `🟠 2 need you · 🟢 1 done · 🔵 3 working`: red or orange for threads
+waiting on you (red when one failed, and the thread's title when there is only one), green for
+finished runs you haven't opened, blue for running agents. Idle threads only show when nothing
+else does, otherwise it reads `All quiet`. Opening it shows Waiting T3 Threads when something
+needs you, and Search T3 Threads otherwise. Raycast turns background refresh on the first time
+you open the command.
 
 ## Prompt T3 Code
 
@@ -61,7 +94,8 @@ Everything runs against the T3 Code server on this machine, over loopback:
 
 - `GET /api/orchestration/shell` for projects and threads.
 - `GET /.well-known/t3/environment` for the server's orchestration protocol version.
-- `GET /api/auth/websocket-ticket`, then a WebSocket to `/ws`, for creating threads on protocol v2.
+- `GET /api/auth/websocket-ticket`, then a WebSocket to `/ws`, for creating threads and acting on
+  them on protocol v2.
 - `POST /api/orchestration/dispatch` for `thread.create` and `thread.turn.start` on protocol v1.
 
 On protocol v2 the extension sends the `x-t3-orchestration-protocol` header and maps the
@@ -69,6 +103,7 @@ v2 thread fields onto the v1 shape. v2 removed thread creation over HTTP, so Pro
 uses one `orchestration.launchThread` call over the WebSocket: it creates the thread, prepares
 the worktree and sends the first message. Attachments are uploaded first through
 `attachments.createUploadUrl`. On v1 the images travel inside the turn as data URLs.
+Thread actions go through `orchestration.dispatchCommand` on the same WebSocket.
 
 Opening a thread follows its deep link, `t3code://threads/<environmentId>/<threadId>`,
 which T3 Code 0.1.0 and later navigate to directly. The environment id comes from
@@ -89,8 +124,8 @@ server's worktree bootstrap. The path matches T3's own convention,
 `~/.t3/worktrees/<repo>/<branch>`. On v2 the server prepares the worktree.
 
 The preset list comes from the threads you ran recently, so the extension carries no model
-list of its own. Provider names, custom models and starred models are read from
-`~/.t3/userdata/settings.json` and `model-manifest.json`, read-only.
+list of its own. Provider names, custom models, starred models and snooze presets are read
+from `~/.t3/userdata/settings.json` and `model-manifest.json`, read-only.
 
 ## Development
 
